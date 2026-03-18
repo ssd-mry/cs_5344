@@ -1,0 +1,279 @@
+"""
+SCANIA Feature Engineering Pipeline
+Sliding-window temporal aggregation for predictive maintenance.
+
+Target: ordinal class_label (0-4) based on Remaining Useful Life (RUL).
+Evaluation: cost-sensitive (asymmetric cost matrix).
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import time
+
+# ── Configuration ────
+WINDOW_SIZE = 10
+MIN_PERIODS = 3
+
+_cwd = Path(__file__).resolve().parent
+DATASETS_ROOT = _cwd / "Datasets" if (_cwd / "Datasets").exists() else _cwd.parent / "Datasets"
+SCANIA_DIR = DATASETS_ROOT / "SCANIA"
+
+
+# ── Helper Functions ────
+
+def compute_slope(values: np.ndarray) -> float:
+    """Linear regression slope β over equally-spaced time indices.
+
+    β = Σ(t - t̄)(x - x̄) / Σ(t - t̄)²
+    NaN values are dropped before fitting.
+    """
+    mask = ~np.isnan(values)
+    y = values[mask]
+    if len(y) < 2:
+        return np.nan
+    t = np.arange(len(y), dtype=np.float64)
+    t_bar = t.mean()
+    y_bar = y.mean()
+    denom = np.sum((t - t_bar) ** 2)
+    if denom == 0:
+        return 0.0
+    return np.sum((t - t_bar) * (y - y_bar)) / denom
+
+
+def rul_to_ordinal(rul: np.ndarray) -> np.ndarray:
+    """Map RUL values to ordinal risk classes 0-4.
+
+    0: Safe       (RUL > 48)
+    1: Low risk   (24 < RUL ≤ 48)
+    2: Medium     (12 < RUL ≤ 24)
+    3: High risk  ( 6 < RUL ≤ 12)
+    4: Critical   (RUL ≤ 6)
+    """
+    rul = np.asarray(rul, dtype=float)
+    y = np.zeros_like(rul, dtype=int)
+    y[rul <= 48] = 1
+    y[rul <= 24] = 2
+    y[rul <= 12] = 3
+    y[rul <=  6] = 4
+    return y
+
+
+def patch_missing_inplace(dfs: list[pd.DataFrame], sensor_cols: list[str],
+                          fill_values: dict[str, float]):
+    """Fill NaN in sensor columns using pre-computed fill values (in-place)."""
+    for df in dfs:
+        for col in sensor_cols:
+            if col in fill_values and pd.notna(fill_values[col]):
+                df[col] = df[col].fillna(fill_values[col])
+
+
+def build_features(ops_df: pd.DataFrame, sensor_cols: list[str],
+                   w: int = 10, min_p: int = 3) -> pd.DataFrame:
+    """Build one-row-per-vehicle feature matrix from longitudinal sensor data.
+
+    For each vehicle, takes the last `w` time steps and computes:
+      min, max, mean, std, slope  for every sensor column.
+    Also records the last time_step (needed for RUL computation).
+    """
+    ops_df = ops_df.sort_values(["vehicle_id", "time_step"]).reset_index(drop=True)
+
+    total_steps = ops_df.groupby("vehicle_id").size().rename("n_total_steps")
+    last_time = ops_df.groupby("vehicle_id")["time_step"].last().rename("last_time_step")
+
+    tail_df = ops_df.groupby("vehicle_id").tail(w)
+    window_steps = tail_df.groupby("vehicle_id").size().rename("n_window_steps")
+
+    # ── Vectorised standard statistics ──
+    stats = tail_df.groupby("vehicle_id")[sensor_cols].agg(["min", "max", "mean", "std"])
+    stats.columns = [f"{col}_{fn}" for col, fn in stats.columns]
+
+    # ── Slope (requires apply) ──
+    def _slope_row(group):
+        return pd.Series(
+            {f"{col}_slope": compute_slope(group[col].values) for col in sensor_cols}
+        )
+    slopes = tail_df.groupby("vehicle_id").apply(_slope_row, include_groups=False)
+
+    # ── Combine ──
+    features = (total_steps.to_frame()
+                .join(window_steps)
+                .join(last_time)
+                .join(stats)
+                .join(slopes))
+    features.index.name = "vehicle_id"
+    features.reset_index(inplace=True)
+
+    # NaN out rows where the window had too few valid points
+    short_mask = features["n_window_steps"] < min_p
+    if short_mask.any():
+        feat_cols = [c for c in features.columns
+                     if c not in ("vehicle_id", "n_total_steps", "n_window_steps", "last_time_step")]
+        features.loc[short_mask, feat_cols] = np.nan
+        print(f"    ⚠ {short_mask.sum()} vehicles had < {min_p} steps in window, features set to NaN")
+
+    return features
+
+
+def encode_specifications(specs_df: pd.DataFrame,
+                          fit_categories: dict | None = None):
+    """One-hot encode Spec_0 ~ Spec_7.
+
+    When fit_categories is None (training), categories are learned.
+    When provided (val/test), columns are aligned to the training schema.
+    """
+    spec_cols = sorted(c for c in specs_df.columns if c.startswith("Spec_"))
+
+    if fit_categories is None:
+        fit_categories = {
+            col: sorted(specs_df[col].dropna().unique().tolist())
+            for col in spec_cols
+        }
+
+    parts = [specs_df[["vehicle_id"]].copy()]
+    for col in spec_cols:
+        dummies = pd.get_dummies(specs_df[col], prefix=col)
+        for cat_val in fit_categories[col]:
+            dummy_col = f"{col}_{cat_val}"
+            if dummy_col not in dummies.columns:
+                dummies[dummy_col] = 0
+        keep = [f"{col}_{cv}" for cv in fit_categories[col]]
+        parts.append(dummies[keep])
+
+    return pd.concat(parts, axis=1), fit_categories
+
+
+# ── Main Pipeline ────
+
+def main():
+    t_start = time.time()
+    print("=" * 64)
+    print("  SCANIA Feature Engineering Pipeline")
+    print(f"  Window size (w) = {WINDOW_SIZE}  |  Min periods = {MIN_PERIODS}")
+    print("=" * 64)
+
+    # ── Step 1: Load cleaned operational readouts ──
+    print("\n[Step 1] Loading cleaned operational readouts ...")
+    train_ops = pd.read_csv(SCANIA_DIR / "train_ops_cleaned.csv")
+    val_ops   = pd.read_csv(SCANIA_DIR / "validation_ops_cleaned.csv")
+    test_ops  = pd.read_csv(SCANIA_DIR / "test_ops_cleaned.csv")
+
+    sensor_cols = [c for c in train_ops.columns if c not in ("vehicle_id", "time_step")]
+    print(f"  Train : {train_ops.shape[0]:>10,} rows  |  {train_ops['vehicle_id'].nunique():,} vehicles")
+    print(f"  Val   : {val_ops.shape[0]:>10,} rows  |  {val_ops['vehicle_id'].nunique():,} vehicles")
+    print(f"  Test  : {test_ops.shape[0]:>10,} rows  |  {test_ops['vehicle_id'].nunique():,} vehicles")
+    print(f"  Sensor columns: {len(sensor_cols)}")
+
+    # ── Step 2: Patch missing values (fit on train, apply to all) ──
+    print("\n[Step 2] Patching missing values (numeric=mean, categorical=max, fit on train) ...")
+    fill_values = {col: train_ops[col].mean() for col in sensor_cols}
+
+    for name, df in [("Train", train_ops), ("Val", val_ops), ("Test", test_ops)]:
+        before = df[sensor_cols].isna().sum().sum()
+        patch_missing_inplace([df], sensor_cols, fill_values)
+        after = df[sensor_cols].isna().sum().sum()
+        print(f"  {name:5s}: {before:>12,} NaN  →  {after:>12,} NaN")
+
+    # ── Step 3: Temporal aggregation (sliding window) ──
+    print(f"\n[Step 3] Temporal aggregation (last {WINDOW_SIZE} steps per vehicle) ...")
+
+    t0 = time.time()
+    train_feat = build_features(train_ops, sensor_cols, WINDOW_SIZE, MIN_PERIODS)
+    print(f"  Train : {train_feat.shape}  ({time.time() - t0:.1f}s)")
+
+    t0 = time.time()
+    val_feat = build_features(val_ops, sensor_cols, WINDOW_SIZE, MIN_PERIODS)
+    print(f"  Val   : {val_feat.shape}  ({time.time() - t0:.1f}s)")
+
+    t0 = time.time()
+    test_feat = build_features(test_ops, sensor_cols, WINDOW_SIZE, MIN_PERIODS)
+    print(f"  Test  : {test_feat.shape}  ({time.time() - t0:.1f}s)")
+
+    # ── Step 4: Compute ordinal labels (0-4) from RUL ──
+    print("\n[Step 4] Computing ordinal labels from RUL ...")
+    train_tte  = pd.read_csv(SCANIA_DIR / "train_tte.csv")
+    val_labels = pd.read_csv(SCANIA_DIR / "validation_labels.csv")
+
+    # --- Training labels: derived from RUL ---
+    # RUL = length_of_study_time_step - last_time_step (for repaired vehicles)
+    # Censored vehicles (in_study_repair == 0) → class 0
+    train_feat = train_feat.merge(
+        train_tte[["vehicle_id", "length_of_study_time_step", "in_study_repair"]],
+        on="vehicle_id", how="left"
+    )
+    rep  = train_feat["in_study_repair"].to_numpy()
+    T    = train_feat["length_of_study_time_step"].to_numpy()
+    t_cur = train_feat["last_time_step"].to_numpy()
+
+    rul = np.where(rep == 1, np.maximum(T - t_cur, 0.0), np.inf)
+    train_feat["label"] = np.where(np.isfinite(rul), rul_to_ordinal(rul), 0)
+    train_feat.drop(columns=["length_of_study_time_step", "in_study_repair"], inplace=True)
+
+    # --- Validation labels: already provided as class_label 0-4 ---
+    val_labels = val_labels.rename(columns={"class_label": "label"})
+    val_feat = val_feat.merge(val_labels[["vehicle_id", "label"]], on="vehicle_id", how="left")
+
+    for split, df in [("Train", train_feat), ("Val", val_feat)]:
+        print(f"  {split} label distribution:")
+        for lbl, cnt in df["label"].value_counts().sort_index().items():
+            pct = 100 * cnt / len(df)
+            print(f"    class {lbl}: {cnt:>6,}  ({pct:.1f}%)")
+
+    # ── Step 5: Encode and merge vehicle specifications ──
+    print("\n[Step 5] Encoding vehicle specifications (one-hot) ...")
+    train_specs = pd.read_csv(SCANIA_DIR / "train_specifications.csv")
+    val_specs   = pd.read_csv(SCANIA_DIR / "validation_specifications.csv")
+    test_specs  = pd.read_csv(SCANIA_DIR / "test_specifications.csv")
+
+    # Patch missing categorical values with max (fit on train)
+    spec_cols = sorted(c for c in train_specs.columns if c.startswith("Spec_"))
+    cat_fill = {col: train_specs[col].max() for col in spec_cols}
+    n_cat_patched = 0
+    for specs_df in [train_specs, val_specs, test_specs]:
+        for col in spec_cols:
+            n_missing = specs_df[col].isna().sum()
+            if n_missing > 0:
+                specs_df[col] = specs_df[col].fillna(cat_fill[col])
+                n_cat_patched += n_missing
+    print(f"  Categorical missing values patched (max): {n_cat_patched}")
+
+    train_specs_enc, spec_cats = encode_specifications(train_specs)
+    val_specs_enc, _           = encode_specifications(val_specs, spec_cats)
+    test_specs_enc, _          = encode_specifications(test_specs, spec_cats)
+
+    train_feat = train_feat.merge(train_specs_enc, on="vehicle_id", how="left")
+    val_feat   = val_feat.merge(val_specs_enc, on="vehicle_id", how="left")
+    test_feat  = test_feat.merge(test_specs_enc, on="vehicle_id", how="left")
+
+    n_spec_cols = sum(len(v) for v in spec_cats.values())
+    print(f"  Added {n_spec_cols} one-hot specification columns")
+
+    # ── Step 6: Save ──
+    print("\n[Step 6] Saving feature datasets ...")
+    out_train = SCANIA_DIR / f"train_features_w{WINDOW_SIZE}.csv"
+    out_val   = SCANIA_DIR / f"validation_features_w{WINDOW_SIZE}.csv"
+    out_test  = SCANIA_DIR / f"test_features_w{WINDOW_SIZE}.csv"
+
+    train_feat.to_csv(out_train, index=False)
+    val_feat.to_csv(out_val, index=False)
+    test_feat.to_csv(out_test, index=False)
+
+    print(f"  {out_train.name:40s}  {train_feat.shape}")
+    print(f"  {out_val.name:40s}  {val_feat.shape}")
+    print(f"  {out_test.name:40s}  {test_feat.shape}")
+
+#summary
+    n_sensor_feats = len(sensor_cols) * 5
+    print(f"\n{'─' * 64}")
+    print(f"  Features per vehicle:")
+    print(f"    {len(sensor_cols)} sensors × 5 aggregations (min/max/mean/std/slope) = {n_sensor_feats}")
+    print(f"    + {n_spec_cols} specification one-hot columns")
+    print(f"    + 3 metadata columns (n_total_steps, n_window_steps, last_time_step)")
+    print(f"    + 1 label column (train/val only)")
+    print(f"    = {n_sensor_feats + n_spec_cols + 3 + 1} total columns (train/val)")
+    print(f"\n  Total time: {time.time() - t_start:.1f}s")
+    print("  Done!")
+
+
+if __name__ == "__main__":
+    main()
