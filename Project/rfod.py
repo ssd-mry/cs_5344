@@ -462,7 +462,7 @@ elif dataset_name == "loan_sub":
     ]
     num_cols = [col for col in X.columns if col not in categ_cols]
 
-elif dataset_name == "scania":
+elif dataset_name == "scania2":
     train_vehicle = pd.read_csv(
         "/home/yushuo/Longitudinal/data/scania/vehicle_train.csv"
     )
@@ -17775,6 +17775,74 @@ elif dataset_name == "backblaze":
     categ_cols = ["model"]
     num_cols = [col for col in X.columns if col not in categ_cols]
     target = "label"
+
+elif dataset_name == "scania":
+    sc_train_ops_path   = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_operational_readouts.csv"
+    sc_train_spec_path  = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_specifications.csv"
+    sc_train_tte_path   = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_tte.csv"
+    sc_val_ops_path     = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_operational_readouts.csv"
+    sc_val_spec_path    = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_specifications.csv"
+    sc_val_labels_path  = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_labels.csv"
+
+    def _sc_last_readout(df_ops):
+        df_ops = df_ops.sort_values(["vehicle_id", "time_step"])
+        return df_ops.drop_duplicates("vehicle_id", keep="last")
+
+    def _sc_rul_to_ordinal(rul):
+        rul = np.asarray(rul, dtype=float)
+        y = np.zeros_like(rul, dtype=int)
+        y[rul <= 48] = 1
+        y[rul <= 24] = 2
+        y[rul <= 12] = 3
+        y[rul <=  6] = 4
+        return y
+
+    # --- Training set ---
+    ops_tr  = pd.read_csv(sc_train_ops_path)
+    spec_tr = pd.read_csv(sc_train_spec_path)
+    tte_tr  = pd.read_csv(sc_train_tte_path)
+
+    df_tr = (
+        _sc_last_readout(ops_tr)
+        .merge(spec_tr, on="vehicle_id", how="inner")
+        .merge(tte_tr,  on="vehicle_id", how="inner")
+    )
+
+    t_cur = df_tr["time_step"].to_numpy()
+    T     = df_tr["length_of_study_time_step"].to_numpy()
+    rep   = df_tr["in_study_repair"].to_numpy()
+    rul   = np.where(rep == 1, np.maximum(T - t_cur, 0.0), np.inf)
+    df_tr["y"] = np.where(np.isfinite(rul), _sc_rul_to_ordinal(rul), 0)
+
+    drop_cols_sc = ["vehicle_id", "time_step", "in_study_repair", "length_of_study_time_step"]
+    X_sc_train = df_tr.drop(columns=drop_cols_sc + ["y"], errors="ignore")
+    y_sc_train = df_tr["y"].astype(int)
+
+    # --- Validation set ---
+    ops_va  = pd.read_csv(sc_val_ops_path)
+    spec_va = pd.read_csv(sc_val_spec_path)
+    lab_va  = pd.read_csv(sc_val_labels_path)
+
+    y_col = "class_label" if "class_label" in lab_va.columns else lab_va.columns[-1]
+    df_va = (
+        _sc_last_readout(ops_va)
+        .merge(spec_va, on="vehicle_id", how="inner")
+        .merge(lab_va[["vehicle_id", y_col]], on="vehicle_id", how="inner")
+        .rename(columns={y_col: "y"})
+    )
+
+    X_sc_val = df_va.drop(columns=drop_cols_sc + ["y"], errors="ignore")
+    y_sc_val = df_va["y"].astype(int)
+
+    X = pd.concat([X_sc_train, X_sc_val], ignore_index=True)
+    y_raw = pd.concat([y_sc_train, y_sc_val], ignore_index=True)
+
+    # Binary label: 0 = healthy, 1 = at-risk (y > 0)
+    y = (y_raw > 0).astype(int)
+
+    categ_cols = ["Spec_0", "Spec_1", "Spec_2", "Spec_3", "Spec_4", "Spec_5", "Spec_6", "Spec_7"]
+    num_cols = [col for col in X.columns if col not in categ_cols]
+    target = "y"
 
 X = X.replace("?", np.nan)
 # y = data[target]
