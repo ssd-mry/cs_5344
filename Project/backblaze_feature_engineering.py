@@ -185,7 +185,7 @@ def _resolve_fill_value(series: pd.Series, strategy: FillStrategy, column_name: 
 
 def patch_missing_values(
     df: pd.DataFrame,
-    numeric_fill_strategy: FillStrategy = "mean",
+    numeric_fill_strategy: FillStrategy = "median",
     categorical_fill_strategy: FillStrategy = "max",
     exclude_cols: Iterable[str] = REQUIRED_COLUMNS,
 ) -> pd.DataFrame:
@@ -380,7 +380,7 @@ def build_feature_dataset(
     window_size: int = 7,
     censored_rul_value: int | None = 9999,
     drop_censored: bool = False,
-    numeric_fill_strategy: FillStrategy = "mean",
+    numeric_fill_strategy: FillStrategy = "median",
     categorical_fill_strategy: FillStrategy = "max",
 ) -> pd.DataFrame:
     """End-to-end helper for RUL computation, label generation, and rolling features."""
@@ -477,7 +477,7 @@ def main() -> None:
         window_size=7,
         censored_rul_value=9999,
         drop_censored=False,
-        numeric_fill_strategy="mean",
+        numeric_fill_strategy="median",
         categorical_fill_strategy="max",
     )
 
