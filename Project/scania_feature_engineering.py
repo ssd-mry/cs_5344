@@ -232,8 +232,8 @@ def main():
     print(f"  Sensor columns: {len(sensor_cols)}")
 
     # ── Step 2: Patch missing values (fit on train, apply to all) ──
-    print("\n[Step 2] Patching missing values (numeric=mean, categorical=max, fit on train) ...")
-    fill_values = {col: train_ops[col].mean() for col in sensor_cols}
+    print("\n[Step 2] Patching missing values (numeric=median, categorical=max, fit on train) ...")
+    fill_values = {col: train_ops[col].median() for col in sensor_cols}
 
     for name, df in [("Train", train_ops), ("Val", val_ops), ("Test", test_ops)]:
         before = df[sensor_cols].isna().sum().sum()
