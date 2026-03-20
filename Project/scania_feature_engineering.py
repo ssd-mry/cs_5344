@@ -5,6 +5,7 @@ Sliding-window temporal aggregation for predictive maintenance.
 Target: ordinal class_label (0-4) based on Remaining Useful Life (RUL).
 Evaluation: cost-sensitive (asymmetric cost matrix).
 """
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -143,7 +144,71 @@ def encode_specifications(specs_df: pd.DataFrame,
     return pd.concat(parts, axis=1), fit_categories
 
 
+def find_cols_to_keep(df, exclude_cols, missing_threshold=0.8):
+    """Decide which columns to keep based on training data."""
+    exclude = set(exclude_cols)
+    cands = [c for c in df.columns if c not in exclude]
+    steps = []
+
+    # 1. High-missing (subsumes All-NaN since ratio 1.0 > threshold)
+    miss = df[cands].isna().mean()
+    drop = miss[miss > missing_threshold].index.tolist()
+    if drop:
+        steps.append(("High-missing", drop))
+        cands = [c for c in cands if c not in set(drop)]
+
+    # 2. Constant
+    nuniq = df[cands].nunique()
+    drop = nuniq[nuniq <= 1].index.tolist()
+    if drop:
+        steps.append(("Constant", drop))
+        cands = [c for c in cands if c not in set(drop)]
+
+    # 3. Duplicate (hash-based, avoids costly transpose)
+    seen, drop = {}, []
+    for c in cands:
+        h = hashlib.sha256(pd.util.hash_pandas_object(df[c]).values.tobytes()).hexdigest()
+        if h in seen:
+            drop.append(c)
+        else:
+            seen[h] = c
+    if drop:
+        steps.append(("Duplicate", drop))
+        cands = [c for c in cands if c not in set(drop)]
+
+    keep = [c for c in df.columns if c in exclude or c in set(cands)]
+
+    for name, dropped in steps:
+        preview = str(dropped[:5]) + ("..." if len(dropped) > 5 else "")
+        print(f"  {name}: dropped {len(dropped)}  {preview}")
+    print(f"  Result: {df.shape[1]} cols \u2192 {len(keep)} cols\n")
+    return keep
+
+
+def clean_split(train, val, test, exclude_cols, missing_threshold=0.8):
+    """Fit on train, align val/test columns."""
+    keep = find_cols_to_keep(train, exclude_cols, missing_threshold)
+    return train[keep], val.reindex(columns=keep), test.reindex(columns=keep)
+
+
+def clean_dataset():
+    ops_tr = pd.read_csv(SCANIA_DIR / "train_operational_readouts.csv")
+    ops_va = pd.read_csv(SCANIA_DIR / "validation_operational_readouts.csv")
+    ops_te = pd.read_csv(SCANIA_DIR / "test_operational_readouts.csv")
+
+    print("Scania Cleaning:")
+    ops_tr, ops_va, ops_te = clean_split(
+        ops_tr, ops_va, ops_te,
+        exclude_cols=["vehicle_id", "time_step"],
+    )
+
+    ops_tr.to_csv(SCANIA_DIR / "train_ops_cleaned.csv", index=False)
+    ops_va.to_csv(SCANIA_DIR / "validation_ops_cleaned.csv", index=False)
+    ops_te.to_csv(SCANIA_DIR / "test_ops_cleaned.csv", index=False)
+    print(f"Saved. Train: {ops_tr.shape} | Val: {ops_va.shape} | Test: {ops_te.shape}")
+
 # ── Main Pipeline ────
+
 
 def main():
     t_start = time.time()
@@ -151,6 +216,8 @@ def main():
     print("  SCANIA Feature Engineering Pipeline")
     print(f"  Window size (w) = {WINDOW_SIZE}  |  Min periods = {MIN_PERIODS}")
     print("=" * 64)
+
+    clean_dataset()
 
     # ── Step 1: Load cleaned operational readouts ──
     print("\n[Step 1] Loading cleaned operational readouts ...")
