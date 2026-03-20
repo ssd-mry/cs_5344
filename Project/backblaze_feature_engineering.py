@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
@@ -13,8 +13,10 @@ REQUIRED_COLUMNS = ("date", "serial_number", "failure")
 ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std", "first", "last")
 SUPPORTED_ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std")
 
-DATA_PATH = "Datasets/Backblaze/train_set.csv"
-CLEAN_OUTPUT_DIR = Path("Datasets/Backblaze/clean")
+TRAIN_PATH = "Datasets/BackBlaze/train_set.csv"
+VAL_PATH = "Datasets/BackBlaze/val_set.csv"
+CLEAN_OUTPUT_DIR = Path("Datasets/BackBlaze/clean")
+
 
 @dataclass(frozen=True)
 class CleaningReport:
@@ -92,10 +94,8 @@ def find_cols_to_keep(
     # if numeric_candidates:
     #     variance = df[numeric_candidates].var(skipna=True)
     #     dropped_low_variance = variance[variance.fillna(0.0) <= low_variance_threshold].index.tolist()
-    #     print(variance)
     #     if dropped_low_variance:
     #         dropped = set(dropped_low_variance)
-    #         print("drop low variance:", dropped)
     #         candidates = [column for column in candidates if column not in dropped]
 
     seen_hashes: dict[str, str] = {}
@@ -159,6 +159,29 @@ def clean_dataset(
     return df.loc[:, report.kept_columns].copy(), report
 
 
+def compute_fill_values(
+    df: pd.DataFrame,
+    numeric_fill_strategy: FillStrategy = "median",
+    categorical_fill_strategy: FillStrategy = "max",
+    exclude_cols: Iterable[str] = REQUIRED_COLUMNS,
+) -> dict[str, object]:
+    """Fit per-column fill values from a reference dataframe, typically train data."""
+    fill_values: dict[str, object] = {}
+    excluded = set(exclude_cols)
+
+    for column in df.columns:
+        if column in excluded or not df[column].isna().any():
+            continue
+
+        strategy = numeric_fill_strategy if is_numeric_dtype(df[column]) else categorical_fill_strategy
+        fill_value = _resolve_fill_value(df[column], strategy, column)
+        if pd.isna(fill_value):
+            continue
+        fill_values[column] = fill_value
+
+    return fill_values
+
+
 def _resolve_fill_value(series: pd.Series, strategy: FillStrategy, column_name: str) -> object:
     non_null = series.dropna()
     if non_null.empty:
@@ -188,6 +211,7 @@ def patch_missing_values(
     numeric_fill_strategy: FillStrategy = "median",
     categorical_fill_strategy: FillStrategy = "max",
     exclude_cols: Iterable[str] = REQUIRED_COLUMNS,
+    fill_values: Mapping[str, object] | None = None,
 ) -> pd.DataFrame:
     """
     Patch missing values after column filtering and before RUL computation.
@@ -197,6 +221,16 @@ def patch_missing_values(
     """
     processed = df.copy()
     excluded = set(exclude_cols)
+    resolved_fill_values = (
+        dict(fill_values)
+        if fill_values is not None
+        else compute_fill_values(
+            processed,
+            numeric_fill_strategy=numeric_fill_strategy,
+            categorical_fill_strategy=categorical_fill_strategy,
+            exclude_cols=excluded,
+        )
+    )
 
     numeric_patched_columns = 0
     categorical_patched_columns = 0
@@ -205,17 +239,14 @@ def patch_missing_values(
         if column in excluded or not processed[column].isna().any():
             continue
 
+        fill_value = resolved_fill_values.get(column, pd.NA)
+        if pd.isna(fill_value):
+            continue
+
+        processed[column] = processed[column].fillna(fill_value)
         if is_numeric_dtype(processed[column]):
-            fill_value = _resolve_fill_value(processed[column], numeric_fill_strategy, column)
-            if pd.isna(fill_value):
-                continue
-            processed[column] = processed[column].fillna(fill_value)
             numeric_patched_columns += 1
         else:
-            fill_value = _resolve_fill_value(processed[column], categorical_fill_strategy, column)
-            if pd.isna(fill_value):
-                continue
-            processed[column] = processed[column].fillna(fill_value)
             categorical_patched_columns += 1
 
     print(
@@ -225,6 +256,53 @@ def patch_missing_values(
         f"'{categorical_fill_strategy}'"
     )
     return processed
+
+
+def clean_train_val_datasets(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    exclude_cols: Iterable[str] = REQUIRED_COLUMNS,
+    missing_threshold: float = 0.8,
+    low_variance_threshold: float = 1e-8,
+    prefer_raw_smart: bool = True,
+    numeric_fill_strategy: FillStrategy = "median",
+    categorical_fill_strategy: FillStrategy = "max",
+) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
+    """Fit cleaning and fill values on train, then apply the same schema to validation."""
+    report = find_cols_to_keep(
+        df=train_df,
+        exclude_cols=exclude_cols,
+        missing_threshold=missing_threshold,
+        low_variance_threshold=low_variance_threshold,
+        prefer_raw_smart=prefer_raw_smart,
+    )
+
+    clean_train_df = train_df.loc[:, report.kept_columns].copy()
+    clean_val_df = val_df.reindex(columns=report.kept_columns).copy()
+
+    fill_values = compute_fill_values(
+        clean_train_df,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+        exclude_cols=exclude_cols,
+    )
+
+    patched_train_df = patch_missing_values(
+        clean_train_df,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+        exclude_cols=exclude_cols,
+        fill_values=fill_values,
+    )
+    patched_val_df = patch_missing_values(
+        clean_val_df,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+        exclude_cols=exclude_cols,
+        fill_values=fill_values,
+    )
+
+    return patched_train_df, patched_val_df, report
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -382,12 +460,19 @@ def build_feature_dataset(
     drop_censored: bool = False,
     numeric_fill_strategy: FillStrategy = "median",
     categorical_fill_strategy: FillStrategy = "max",
+    fill_values: Mapping[str, object] | None = None,
+    patch_missing: bool = True,
 ) -> pd.DataFrame:
     """End-to-end helper for RUL computation, label generation, and rolling features."""
-    patched_df = patch_missing_values(
-        df,
-        numeric_fill_strategy=numeric_fill_strategy,
-        categorical_fill_strategy=categorical_fill_strategy,
+    patched_df = (
+        patch_missing_values(
+            df,
+            numeric_fill_strategy=numeric_fill_strategy,
+            categorical_fill_strategy=categorical_fill_strategy,
+            fill_values=fill_values,
+        )
+        if patch_missing or fill_values is not None
+        else df.copy()
     )
     with_rul = compute_rul(
         patched_df,
@@ -398,20 +483,70 @@ def build_feature_dataset(
     return temporal_aggregation(with_labels, window_size=window_size)
 
 
-def load_data(path: str = DATA_PATH, nrows: int | None = None) -> pd.DataFrame:
+def build_train_val_feature_datasets(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    window_size: int = 7,
+    censored_rul_value: int | None = 9999,
+    drop_censored: bool = False,
+    exclude_cols: Iterable[str] = REQUIRED_COLUMNS,
+    missing_threshold: float = 0.8,
+    low_variance_threshold: float = 1e-8,
+    prefer_raw_smart: bool = True,
+    numeric_fill_strategy: FillStrategy = "median",
+    categorical_fill_strategy: FillStrategy = "max",
+) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
+    """Produce train and validation feature datasets using train-fitted cleaning rules."""
+    clean_train_df, clean_val_df, report = clean_train_val_datasets(
+        train_df=train_df,
+        val_df=val_df,
+        exclude_cols=exclude_cols,
+        missing_threshold=missing_threshold,
+        low_variance_threshold=low_variance_threshold,
+        prefer_raw_smart=prefer_raw_smart,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+    )
+
+    train_feature_df = build_feature_dataset(
+        clean_train_df,
+        window_size=window_size,
+        censored_rul_value=censored_rul_value,
+        drop_censored=drop_censored,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+        patch_missing=False,
+    )
+    val_feature_df = build_feature_dataset(
+        clean_val_df,
+        window_size=window_size,
+        censored_rul_value=censored_rul_value,
+        drop_censored=drop_censored,
+        numeric_fill_strategy=numeric_fill_strategy,
+        categorical_fill_strategy=categorical_fill_strategy,
+        patch_missing=False,
+    )
+    val_feature_df = val_feature_df.drop(
+        columns=[column for column in ("failure_date", "rul_days", "label") if column in val_feature_df.columns]
+    )
+
+    return train_feature_df, val_feature_df, report
+
+def load_data(path: str, nrows: int | None = None) -> pd.DataFrame:
     return pd.read_csv(path, nrows=nrows)
 
 
 def run_case(
     name: str,
-    df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
     *,
     window_size: int,
     censored_rul_value: int | None,
     drop_censored: bool,
-    numeric_fill_strategy: str = "mean",
+    numeric_fill_strategy: str = "median",
     categorical_fill_strategy: str = "max",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     print(f"\n=== {name} ===")
     print(
         f"window_size={window_size}, "
@@ -421,8 +556,9 @@ def run_case(
         f"categorical_fill_strategy={categorical_fill_strategy}"
     )
 
-    feature_df = build_feature_dataset(
-        df,
+    train_feature_df, val_feature_df, report = build_train_val_feature_datasets(
+        train_df=train_df,
+        val_df=val_df,
         window_size=window_size,
         censored_rul_value=censored_rul_value,
         drop_censored=drop_censored,
@@ -430,36 +566,6 @@ def run_case(
         categorical_fill_strategy=categorical_fill_strategy,
     )
 
-    print("shape:", feature_df.shape)
-    print("label counts:", feature_df["label"].value_counts(dropna=False).sort_index().to_dict())
-    print("rul range:", (feature_df["rul_days"].min(), feature_df["rul_days"].max()))
-    print(
-        feature_df[
-            ["serial_number", "date", "failure", "rul_days", "label"]
-        ].head(10).to_string(index=False)
-    )
-
-    sample_feature_cols = [
-        c for c in feature_df.columns
-        if c.endswith("_mean") or c.endswith("_first") or c.endswith("_last")
-    ][:10]
-    print("sample feature columns:", sample_feature_cols)
-
-    CLEAN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = CLEAN_OUTPUT_DIR / f"train_set_window_{window_size}_{timestamp}.csv"
-    feature_df.to_csv(output_path, index=False)
-    print("saved feature dataset to:", output_path)
-
-    return feature_df
-
-
-def main() -> None:
-    raw_df = load_data(nrows=999999)
-    print("raw shape: ", raw_df.shape)
-
-    clean_df, report = clean_dataset(raw_df)
-    print("cleaned shape:", clean_df.shape)
     print(
         "cleaning report:",
         {
@@ -471,9 +577,49 @@ def main() -> None:
         },
     )
 
+    print("train shape:", train_feature_df.shape)
+    print("train label counts:", train_feature_df["label"].value_counts(dropna=False).sort_index().to_dict())
+    print("train rul range:", (train_feature_df["rul_days"].min(), train_feature_df["rul_days"].max()))
+    print(
+        train_feature_df[
+            ["serial_number", "date", "failure", "rul_days", "label"]
+        ].head(10).to_string(index=False)
+    )
+    print("val shape:", val_feature_df.shape)
+    print(
+        val_feature_df[
+            ["serial_number", "date", "failure"]
+        ].head(10).to_string(index=False)
+    )
+
+    sample_feature_cols = [
+        c for c in train_feature_df.columns
+        if c.endswith("_mean") or c.endswith("_first") or c.endswith("_last")
+    ][:10]
+    print("sample feature columns:", sample_feature_cols)
+
+    CLEAN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    train_output_path = CLEAN_OUTPUT_DIR / f"train_set_window_{window_size}_{timestamp}.csv"
+    val_output_path = CLEAN_OUTPUT_DIR / f"val_set_window_{window_size}_{timestamp}.csv"
+    train_feature_df.to_csv(train_output_path, index=False)
+    val_feature_df.to_csv(val_output_path, index=False)
+    print("saved train feature dataset to:", train_output_path)
+    print("saved val feature dataset to:", val_output_path)
+
+    return train_feature_df, val_feature_df
+
+
+def main() -> None:
+    train_df = load_data(TRAIN_PATH)
+    val_df = load_data(VAL_PATH)
+    print("raw train shape:", train_df.shape)
+    print("raw val shape:", val_df.shape)
+
     run_case(
         "default config",
-        clean_df,
+        train_df,
+        val_df,
         window_size=7,
         censored_rul_value=9999,
         drop_censored=False,
@@ -514,5 +660,5 @@ def main() -> None:
     # )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
