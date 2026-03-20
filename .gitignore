@@ -11,6 +11,4 @@ venv/
 
 *.log
 
-data
-#data/**/*_cleaned.csv
-#data/backblaze/sample/*.csv
+.csv
