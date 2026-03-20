@@ -13,8 +13,8 @@ REQUIRED_COLUMNS = ("date", "serial_number", "failure")
 ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std", "first", "last")
 SUPPORTED_ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std")
 
-DATA_PATH = "Datasets/Backblaze/backblaze_data/train_set.csv"
-CLEAN_OUTPUT_DIR = Path("Datasets/Backblaze/backblaze_data/clean")
+DATA_PATH = "Datasets/Backblaze/train_set.csv"
+CLEAN_OUTPUT_DIR = Path("Datasets/Backblaze/clean")
 
 @dataclass(frozen=True)
 class CleaningReport:
