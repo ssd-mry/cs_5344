@@ -1,10 +1,3 @@
-"""
-SCANIA Feature Engineering Pipeline
-Sliding-window temporal aggregation for predictive maintenance.
-
-Target: ordinal class_label (0-4) based on Remaining Useful Life (RUL).
-Evaluation: cost-sensitive (asymmetric cost matrix).
-"""
 import hashlib
 
 import numpy as np
@@ -19,7 +12,6 @@ MIN_PERIODS = 3
 _cwd = Path(__file__).resolve().parent
 DATASETS_ROOT = _cwd / "Datasets" if (_cwd / "Datasets").exists() else _cwd.parent / "Datasets"
 SCANIA_DIR = DATASETS_ROOT / "SCANIA"
-
 
 # ── Helper Functions ────
 
@@ -71,47 +63,33 @@ def patch_missing_inplace(dfs: list[pd.DataFrame], sensor_cols: list[str],
 
 def build_features(ops_df: pd.DataFrame, sensor_cols: list[str],
                    w: int = 10, min_p: int = 3) -> pd.DataFrame:
-    """Build one-row-per-vehicle feature matrix from longitudinal sensor data.
 
-    For each vehicle, takes the last `w` time steps and computes:
-      min, max, mean, std, slope  for every sensor column.
-    Also records the last time_step (needed for RUL computation).
-    """
     ops_df = ops_df.sort_values(["vehicle_id", "time_step"]).reset_index(drop=True)
 
-    total_steps = ops_df.groupby("vehicle_id").size().rename("n_total_steps")
-    last_time = ops_df.groupby("vehicle_id")["time_step"].last().rename("last_time_step")
+    grouped = ops_df.groupby("vehicle_id", sort=False)[sensor_cols]
 
-    tail_df = ops_df.groupby("vehicle_id").tail(w)
-    window_steps = tail_df.groupby("vehicle_id").size().rename("n_window_steps")
+    # ── Vectorised rolling statistics ──
+    rolling_stats = grouped.rolling(window=w, min_periods=min_p).agg(
+        ["min", "max", "mean", "std"]
+    )
+    rolling_stats.columns = [f"{col}_{fn}" for col, fn in rolling_stats.columns]
+    rolling_stats = rolling_stats.reset_index(level=0, drop=True)
 
-    # ── Vectorised standard statistics ──
-    stats = tail_df.groupby("vehicle_id")[sensor_cols].agg(["min", "max", "mean", "std"])
-    stats.columns = [f"{col}_{fn}" for col, fn in stats.columns]
+    # ── Slope ──
+    rolling_slope = grouped.rolling(window=w, min_periods=min_p).apply(
+        compute_slope, raw=True
+    )
+    rolling_slope = rolling_slope.reset_index(level=0, drop=True)
+    rolling_slope = rolling_slope.rename(
+        columns={col: f"{col}_slope" for col in sensor_cols}
+    )
 
-    # ── Slope (requires apply) ──
-    def _slope_row(group):
-        return pd.Series(
-            {f"{col}_slope": compute_slope(group[col].values) for col in sensor_cols}
-        )
-    slopes = tail_df.groupby("vehicle_id").apply(_slope_row, include_groups=False)
-
-    # ── Combine ──
-    features = (total_steps.to_frame()
-                .join(window_steps)
-                .join(last_time)
-                .join(stats)
-                .join(slopes))
-    features.index.name = "vehicle_id"
-    features.reset_index(inplace=True)
-
-    # NaN out rows where the window had too few valid points
-    short_mask = features["n_window_steps"] < min_p
-    if short_mask.any():
-        feat_cols = [c for c in features.columns
-                     if c not in ("vehicle_id", "n_total_steps", "n_window_steps", "last_time_step")]
-        features.loc[short_mask, feat_cols] = np.nan
-        print(f"    ⚠ {short_mask.sum()} vehicles had < {min_p} steps in window, features set to NaN")
+    # ── Combine with identity columns ──
+    features = pd.concat([
+        ops_df[["vehicle_id", "time_step"]].reset_index(drop=True),
+        rolling_stats.reset_index(drop=True),
+        rolling_slope.reset_index(drop=True),
+    ], axis=1)
 
     return features
 
@@ -242,7 +220,7 @@ def main():
         print(f"  {name:5s}: {before:>12,} NaN  →  {after:>12,} NaN")
 
     # ── Step 3: Temporal aggregation (sliding window) ──
-    print(f"\n[Step 3] Temporal aggregation (last {WINDOW_SIZE} steps per vehicle) ...")
+    print(f"\n[Step 3] Temporal aggregation (window={WINDOW_SIZE}, min_periods={MIN_PERIODS}) ...")
 
     t0 = time.time()
     train_feat = build_features(train_ops, sensor_cols, WINDOW_SIZE, MIN_PERIODS)
@@ -261,22 +239,23 @@ def main():
     train_tte  = pd.read_csv(SCANIA_DIR / "train_tte.csv")
     val_labels = pd.read_csv(SCANIA_DIR / "validation_labels.csv")
 
-    # --- Training labels: derived from RUL ---
-    # RUL = length_of_study_time_step - last_time_step (for repaired vehicles)
-    # Censored vehicles (in_study_repair == 0) → class 0
+    # --- Training labels: per-row RUL ---
     train_feat = train_feat.merge(
         train_tte[["vehicle_id", "length_of_study_time_step", "in_study_repair"]],
         on="vehicle_id", how="left"
     )
     rep  = train_feat["in_study_repair"].to_numpy()
     T    = train_feat["length_of_study_time_step"].to_numpy()
-    t_cur = train_feat["last_time_step"].to_numpy()
+    t_cur = train_feat["time_step"].to_numpy()
 
     rul = np.where(rep == 1, np.maximum(T - t_cur, 0.0), np.inf)
     train_feat["label"] = np.where(np.isfinite(rul), rul_to_ordinal(rul), 0)
     train_feat.drop(columns=["length_of_study_time_step", "in_study_repair"], inplace=True)
 
-    # --- Validation labels: already provided as class_label 0-4 ---
+    # --- Validation / Test: keep last row per vehicle (labels are per-vehicle) ---
+    val_feat  = val_feat.groupby("vehicle_id").tail(1).reset_index(drop=True)
+    test_feat = test_feat.groupby("vehicle_id").tail(1).reset_index(drop=True)
+
     val_labels = val_labels.rename(columns={"class_label": "label"})
     val_feat = val_feat.merge(val_labels[["vehicle_id", "label"]], on="vehicle_id", how="left")
 
@@ -332,12 +311,12 @@ def main():
 #summary
     n_sensor_feats = len(sensor_cols) * 5
     print(f"\n{'─' * 64}")
-    print(f"  Features per vehicle:")
+    print(f"  Features per row:")
     print(f"    {len(sensor_cols)} sensors × 5 aggregations (min/max/mean/std/slope) = {n_sensor_feats}")
     print(f"    + {n_spec_cols} specification one-hot columns")
-    print(f"    + 3 metadata columns (n_total_steps, n_window_steps, last_time_step)")
+    print(f"    + 2 identity columns (vehicle_id, time_step)")
     print(f"    + 1 label column (train/val only)")
-    print(f"    = {n_sensor_feats + n_spec_cols + 3 + 1} total columns (train/val)")
+    print(f"    = {n_sensor_feats + n_spec_cols + 2 + 1} total columns (train/val)")
     print(f"\n  Total time: {time.time() - t_start:.1f}s")
     print("  Done!")
 
