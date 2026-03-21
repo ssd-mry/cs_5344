@@ -41,7 +41,7 @@ from badgers.generators.tabular_data.outliers import DecompositionAndOutlierGene
 from sklearn.utils import shuffle
 from numpy.random import default_rng
 
-base_dir = "/home/ruiyao/cs_5344/Project"
+base_dir = "/Users/ssdmry/Desktop/mry/新加坡/博士/课程/CS5344_Big Data Analytics/cs_5344/Project"
 parser = argparse.ArgumentParser(description="ndcg + std experiments")
 
 parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
@@ -52,9 +52,9 @@ args = parser.parse_args()
 dataset_name = args.dataset
 sample_frac = args.frac
 
-logs_all_folder = os.path.join(base_dir, "results/logs_all")
-logs_result_folder = os.path.join(base_dir, "results/logs_result")
-scores_folder = os.path.join(base_dir, "results/Scores")
+logs_all_folder = os.path.join("results/logs_all")
+logs_result_folder = os.path.join("results/logs_result")
+scores_folder = os.path.join("results/Scores")
 os.makedirs(logs_all_folder, exist_ok=True)
 os.makedirs(logs_result_folder, exist_ok=True)
 logs_all_folder = os.path.join(logs_all_folder, "rfod_2025_10")
@@ -67,6 +67,7 @@ os.makedirs(logs_all_folder, exist_ok=True)
 os.makedirs(logs_result_folder, exist_ok=True)
 stdout_file = os.path.join(logs_all_folder, f"{dataset_name}.txt")
 resout_file = os.path.join(logs_result_folder, f"{dataset_name}.txt")
+open(resout_file, "w").close()  # 每次运行清空结果文件
 
 
 def print_to_log(*args, **kwargs):
@@ -563,7 +564,7 @@ elif dataset_name == "beth_split":
     categ_cols = [col for col in X.columns if col not in num_cols]
 if dataset_name == "thyroid":
     target = "target"
-    data = pd.read_csv(os.path.join(base_dir, "datasets/thyroid/thyroid.csv"), sep=";")
+    data = pd.read_csv(os.path.join("datasets/thyroid/thyroid.csv"), sep=";")
     X = data.drop(columns=["target"])
     y = data["target"]
 
@@ -17716,10 +17717,10 @@ elif dataset_name == "online_fraud":
     }
 
 elif dataset_name == "backblaze":
-    bb_train_path = "/home/ruiyao/cs_5344/Project/Datasets/Backblaze/backblaze_data/train_set.csv"
-    bb_val_path = "/home/ruiyao/cs_5344/Project/Datasets/Backblaze/backblaze_data/val_set.csv"
-    bb_val_ids_path = "/home/ruiyao/cs_5344/Project/Datasets/Backblaze/backblaze_data/val_serial_number_id.csv"
-    bb_val_labels_path = "/home/ruiyao/cs_5344/Project/Datasets/Backblaze/backblaze_data/val_label.csv"
+    bb_train_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/train_set.csv")
+    bb_val_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_set.csv")
+    bb_val_ids_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_serial_number_id.csv")
+    bb_val_labels_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_label.csv")
 
     def _bb_prepare_training_set(path, horizon_days=60):
         df = pd.read_csv(path, parse_dates=["date"])
@@ -17776,13 +17777,63 @@ elif dataset_name == "backblaze":
     num_cols = [col for col in X.columns if col not in categ_cols]
     target = "label"
 
+elif dataset_name == "backblaze_clean":
+    _bb_clean_dir    = os.path.join(base_dir, "Datasets/Backblaze/clean")
+    _bb_val_ids_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_serial_number_id.csv")
+    _bb_val_lbl_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_label.csv")
+
+    _bb_files      = sorted(os.listdir(_bb_clean_dir))
+    _bb_train_file = next(f for f in _bb_files if f.startswith("train_set"))
+    _bb_val_file   = next(f for f in _bb_files if f.startswith("val_set"))
+
+    _bb_train = pd.read_csv(os.path.join(_bb_clean_dir, _bb_train_file), low_memory=False)
+    _bb_val   = pd.read_csv(os.path.join(_bb_clean_dir, _bb_val_file),   low_memory=False)
+
+    # 只保留故障前 60 天的数据（与原始 backblaze 处理一致）
+    _bb_train = _bb_train[_bb_train["rul_days"] <= 60].reset_index(drop=True)
+
+    # 训练集：去掉 meta 列，提取特征和标签
+    _meta_cols  = {"date", "serial_number", "failure", "failure_date", "rul_days", "label"}
+    _feat_cols  = [c for c in _bb_train.columns if c not in _meta_cols]
+    X_bb_train  = _bb_train[_feat_cols].reset_index(drop=True)
+    y_bb_train  = _bb_train["label"].reset_index(drop=True)
+
+    # 验证集：取每个磁盘最后一行的滚动特征，join val_label.csv 获取标签
+    _bb_val["date"] = pd.to_datetime(_bb_val["date"], errors="coerce")
+    _bb_val_last = (
+        _bb_val.sort_values(["serial_number", "date"])
+               .drop_duplicates("serial_number", keep="last")
+    )
+    _bb_ids    = pd.read_csv(_bb_val_ids_path)
+    _bb_labels = pd.read_csv(_bb_val_lbl_path)
+    _bb_val_merged = (
+        _bb_val_last
+        .merge(_bb_ids,    on="serial_number", how="inner")
+        .merge(_bb_labels, on="id",            how="inner")
+    )
+    _val_feat_cols = [c for c in _feat_cols if c in _bb_val_merged.columns]
+    X_bb_val = _bb_val_merged[_val_feat_cols].reset_index(drop=True)
+    y_bb_val = _bb_val_merged["label"].astype(int).reset_index(drop=True)
+
+    X     = pd.concat([X_bb_train[_val_feat_cols], X_bb_val], ignore_index=True)
+    y_raw = pd.concat([y_bb_train, y_bb_val], ignore_index=True)
+
+    always_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    X = X.drop(columns=always_nan_cols)
+
+    y = (y_raw > 0).astype(int)
+
+    categ_cols = [c for c in ["model"] if c in X.columns]
+    num_cols   = [c for c in X.columns if c not in categ_cols]
+    target     = "label"
+
 elif dataset_name == "scania":
-    sc_train_ops_path   = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_operational_readouts.csv"
-    sc_train_spec_path  = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_specifications.csv"
-    sc_train_tte_path   = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_tte.csv"
-    sc_val_ops_path     = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_operational_readouts.csv"
-    sc_val_spec_path    = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_specifications.csv"
-    sc_val_labels_path  = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/validation_labels.csv"
+    sc_train_ops_path   = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_operational_readouts.csv")
+    sc_train_spec_path  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_specifications.csv")
+    sc_train_tte_path   = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_tte.csv")
+    sc_val_ops_path     = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_operational_readouts.csv")
+    sc_val_spec_path    = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_specifications.csv")
+    sc_val_labels_path  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_labels.csv")
 
     def _sc_last_readout(df_ops):
         df_ops = df_ops.sort_values(["vehicle_id", "time_step"])

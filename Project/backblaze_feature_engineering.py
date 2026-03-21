@@ -11,11 +11,12 @@ from pandas.api.types import is_numeric_dtype
 
 REQUIRED_COLUMNS = ("date", "serial_number", "failure")
 ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std", "first", "last")
-SUPPORTED_ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std")
+SUPPORTED_ROLLING_AGGREGATIONS = ("mean",)
 
-TRAIN_PATH = "Datasets/BackBlaze/train_set.csv"
-VAL_PATH = "Datasets/BackBlaze/val_set.csv"
-CLEAN_OUTPUT_DIR = Path("Datasets/BackBlaze/clean")
+_BASE_DIR = Path(__file__).parent
+TRAIN_PATH = str(_BASE_DIR / "Datasets/Backblaze/backblaze_data/train_set.csv")
+VAL_PATH = str(_BASE_DIR / "Datasets/Backblaze/backblaze_data/val_set.csv")
+CLEAN_OUTPUT_DIR = _BASE_DIR / "Datasets/Backblaze/clean"
 
 
 @dataclass(frozen=True)
@@ -418,27 +419,18 @@ def temporal_aggregation(
     ]
     rolling_features = rolling_features.reset_index(level=0, drop=True)
 
-    first_features = grouped_numeric.rolling(window=window_size, min_periods=min_periods).apply(
-        lambda values: values[0],
-        raw=True,
-    )
-    first_features = first_features.reset_index(level=0, drop=True)
-    first_features = first_features.rename(columns=lambda column: f"{column}_first")
-
-    last_features = aggregated_source.loc[:, numeric_feature_columns].copy()
-    last_features = last_features.rename(columns=lambda column: f"{column}_last")
-
-    rolling_features = pd.concat(
-        [rolling_features.reset_index(drop=True), first_features.reset_index(drop=True), last_features.reset_index(drop=True)],
-        axis=1,
-    )
+    categorical_feature_columns = [
+        column
+        for column in aggregated_source.columns
+        if column not in reserved_columns and not is_numeric_dtype(aggregated_source[column])
+    ]
 
     identity_columns = [column for column in include_identity_columns if column in aggregated_source.columns]
     passthrough_columns = identity_columns + [
         column
         for column in ("failure_date", rul_column, label_column)
         if column in aggregated_source.columns
-    ]
+    ] + categorical_feature_columns
 
     result = pd.concat(
         [aggregated_source.loc[:, passthrough_columns].reset_index(drop=True), rolling_features.reset_index(drop=True)],
@@ -620,7 +612,7 @@ def main() -> None:
         "default config",
         train_df,
         val_df,
-        window_size=7,
+        window_size=30,
         censored_rul_value=9999,
         drop_censored=False,
         numeric_fill_strategy="median",
