@@ -14,8 +14,10 @@ ROLLING_AGGREGATIONS = ("mean", "median", "min", "max", "std", "first", "last")
 SUPPORTED_ROLLING_AGGREGATIONS = ("mean",)
 
 _BASE_DIR = Path(__file__).parent
-TRAIN_PATH = str(_BASE_DIR / "Datasets/Backblaze/backblaze_data/train_set.csv")
-VAL_PATH = str(_BASE_DIR / "Datasets/Backblaze/backblaze_data/val_set.csv")
+TRAIN_PATH = str(_BASE_DIR / "Datasets/Backblaze/train_set.csv")
+VAL_PATH = str(_BASE_DIR / "Datasets/Backblaze/val_set.csv")
+VAL_SERIAL_NUMBER_ID_PATH = str(_BASE_DIR / "Datasets/Backblaze/val_serial_number_id.csv")
+VAL_LABEL_PATH = str(_BASE_DIR / "Datasets/Backblaze/val_label.csv")
 CLEAN_OUTPUT_DIR = _BASE_DIR / "Datasets/Backblaze/clean"
 
 
@@ -30,7 +32,17 @@ class CleaningReport:
 
 
 FillStrategy = str | Callable[[pd.Series], object]
-
+ValidationLabelingMode = str
+LABEL_TO_RUL_BOUNDS = {
+    0: (20, pd.NA),
+    1: (10, 19),
+    2: (0, 9),
+}
+DEFAULT_VALIDATION_LABEL_MIDPOINTS = {
+    0: 9999,
+    1: 15,
+    2: 5,
+}
 
 def _validate_required_columns(
     df: pd.DataFrame,
@@ -378,6 +390,13 @@ def generate_labels(
     return labeled
 
 
+def _label_from_rul_estimate(rul_estimate: pd.Series) -> pd.Series:
+    labels = pd.Series(0, index=rul_estimate.index, dtype="int8")
+    labels.loc[rul_estimate < 20] = 1
+    labels.loc[rul_estimate < 10] = 2
+    return labels
+
+
 def temporal_aggregation(
     df: pd.DataFrame,
     window_size: int = 7,
@@ -475,9 +494,120 @@ def build_feature_dataset(
     return temporal_aggregation(with_labels, window_size=window_size)
 
 
+def generate_validation_labels(
+    val_feature_df: pd.DataFrame,
+    val_serial_number_id_df: pd.DataFrame,
+    val_label_df: pd.DataFrame,
+    labeling_mode: ValidationLabelingMode = "final_only",
+    recent_window_horizon_days: int | None = None,
+    label_midpoints: Mapping[int, int] | None = None,
+    include_auxiliary_columns: bool = False,
+) -> pd.DataFrame:
+    """
+    Attach disk-level validation labels to validation features.
+
+    Validation labels are provided per disk rather than per row.
+
+    Supported modes:
+    - ``final_only``: keep only the last window per disk
+    - ``recent_windows``: keep windows within ``recent_window_horizon_days`` of the prediction date
+      and estimate historical labels using midpoint-based proxy RUL
+    - ``all_windows``: estimate labels for every window using midpoint-based proxy RUL
+    """
+    required_mapping_columns = {"id", "serial_number"}
+    required_label_columns = {"id", "label"}
+    if not required_mapping_columns.issubset(val_serial_number_id_df.columns):
+        raise ValueError(
+            "val_serial_number_id_df must contain columns: ['id', 'serial_number']"
+        )
+    if not required_label_columns.issubset(val_label_df.columns):
+        raise ValueError("val_label_df must contain columns: ['id', 'label']")
+
+    valid_modes = {"final_only", "recent_windows", "all_windows"}
+    if labeling_mode not in valid_modes:
+        raise ValueError(f"labeling_mode must be one of {sorted(valid_modes)}")
+
+    labeled_val_df = preprocess_dataframe(val_feature_df)
+    prediction_dates = (
+        labeled_val_df.groupby("serial_number", sort=False)["date"]
+        .max()
+        .rename("prediction_date")
+    )
+    labeled_val_df = labeled_val_df.join(prediction_dates, on="serial_number")
+    labeled_val_df["days_to_prediction"] = (
+        labeled_val_df["prediction_date"] - labeled_val_df["date"]
+    ).dt.days.astype("int64")
+
+    if labeling_mode == "final_only":
+        labeled_val_df = (
+            labeled_val_df.groupby("serial_number", sort=False, group_keys=False)
+            .tail(1)
+            .reset_index(drop=True)
+        )
+    elif labeling_mode == "recent_windows":
+        if recent_window_horizon_days is None:
+            raise ValueError(
+                "recent_window_horizon_days is required when labeling_mode='recent_windows'"
+            )
+        if recent_window_horizon_days < 0:
+            raise ValueError("recent_window_horizon_days must be non-negative")
+        labeled_val_df = labeled_val_df.loc[
+            labeled_val_df["days_to_prediction"] <= recent_window_horizon_days
+        ].reset_index(drop=True)
+
+    disk_labels = val_serial_number_id_df.loc[:, ["id", "serial_number"]].merge(
+        val_label_df.loc[:, ["id", "label"]],
+        on="id",
+        how="inner",
+    )
+
+    labeled_val_df = labeled_val_df.merge(
+        disk_labels.rename(columns={"label": "label_final"}),
+        on="serial_number",
+        how="left",
+    )
+    if labeled_val_df["label_final"].isna().any():
+        missing_serials = labeled_val_df.loc[
+            labeled_val_df["label_final"].isna(), "serial_number"
+        ].drop_duplicates().tolist()
+        raise ValueError(f"Missing validation labels for serial numbers: {missing_serials[:10]}")
+
+    labeled_val_df["label_final"] = labeled_val_df["label_final"].astype("int8")
+    midpoint_map = dict(DEFAULT_VALIDATION_LABEL_MIDPOINTS if label_midpoints is None else label_midpoints)
+
+    if labeling_mode == "final_only":
+        labeled_val_df["label"] = labeled_val_df["label_final"]
+    else:
+        labeled_val_df["proxy_rul_est"] = (
+            labeled_val_df["label_final"].map(midpoint_map).astype("int64")
+            + labeled_val_df["days_to_prediction"]
+        )
+        labeled_val_df["label"] = _label_from_rul_estimate(labeled_val_df["proxy_rul_est"])
+
+    labeled_val_df["label"] = labeled_val_df["label"].astype("int8")
+
+    if include_auxiliary_columns:
+        rul_bounds = labeled_val_df["label"].map(LABEL_TO_RUL_BOUNDS)
+        labeled_val_df["rul_days_lower"] = rul_bounds.str[0]
+        labeled_val_df["rul_days_upper"] = rul_bounds.str[1]
+    else:
+        labeled_val_df = labeled_val_df.drop(
+            columns=[
+                column
+                for column in ("id", "prediction_date", "days_to_prediction", "label_final", "proxy_rul_est")
+                if column in labeled_val_df.columns
+            ]
+        )
+
+    return labeled_val_df
+
+
+
 def build_train_val_feature_datasets(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
+    val_serial_number_id_df: pd.DataFrame | None = None,
+    val_label_df: pd.DataFrame | None = None,
     window_size: int = 7,
     censored_rul_value: int | None = 9999,
     drop_censored: bool = False,
@@ -487,6 +617,10 @@ def build_train_val_feature_datasets(
     prefer_raw_smart: bool = True,
     numeric_fill_strategy: FillStrategy = "median",
     categorical_fill_strategy: FillStrategy = "max",
+    val_labeling_mode: ValidationLabelingMode = "final_only",
+    val_recent_window_horizon_days: int | None = None,
+    val_label_midpoints: Mapping[int, int] | None = None,
+    include_val_auxiliary_columns: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]:
     """Produce train and validation feature datasets using train-fitted cleaning rules."""
     clean_train_df, clean_val_df, report = clean_train_val_datasets(
@@ -522,7 +656,23 @@ def build_train_val_feature_datasets(
         columns=[column for column in ("failure_date", "rul_days", "label") if column in val_feature_df.columns]
     )
 
+    if val_serial_number_id_df is not None or val_label_df is not None:
+        if val_serial_number_id_df is None or val_label_df is None:
+            raise ValueError(
+                "Both val_serial_number_id_df and val_label_df are required to generate validation labels"
+            )
+        val_feature_df = generate_validation_labels(
+            val_feature_df=val_feature_df,
+            val_serial_number_id_df=val_serial_number_id_df,
+            val_label_df=val_label_df,
+            labeling_mode=val_labeling_mode,
+            recent_window_horizon_days=val_recent_window_horizon_days,
+            label_midpoints=val_label_midpoints,
+            include_auxiliary_columns=include_val_auxiliary_columns,
+        )
+
     return train_feature_df, val_feature_df, report
+
 
 def load_data(path: str, nrows: int | None = None) -> pd.DataFrame:
     return pd.read_csv(path, nrows=nrows)
@@ -532,12 +682,16 @@ def run_case(
     name: str,
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
+    val_serial_number_id_df: pd.DataFrame,
+    val_label_df: pd.DataFrame,
     *,
     window_size: int,
     censored_rul_value: int | None,
     drop_censored: bool,
     numeric_fill_strategy: str = "median",
     categorical_fill_strategy: str = "max",
+    val_labeling_mode: str = "final_only",
+    val_recent_window_horizon_days: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     print(f"\n=== {name} ===")
     print(
@@ -545,17 +699,23 @@ def run_case(
         f"censored_rul_value={censored_rul_value}, "
         f"drop_censored={drop_censored}, "
         f"numeric_fill_strategy={numeric_fill_strategy}, "
-        f"categorical_fill_strategy={categorical_fill_strategy}"
+        f"categorical_fill_strategy={categorical_fill_strategy}, "
+        f"val_labeling_mode={val_labeling_mode}, "
+        f"val_recent_window_horizon_days={val_recent_window_horizon_days}"
     )
 
     train_feature_df, val_feature_df, report = build_train_val_feature_datasets(
         train_df=train_df,
         val_df=val_df,
+        val_serial_number_id_df=val_serial_number_id_df,
+        val_label_df=val_label_df,
         window_size=window_size,
         censored_rul_value=censored_rul_value,
         drop_censored=drop_censored,
         numeric_fill_strategy=numeric_fill_strategy,
         categorical_fill_strategy=categorical_fill_strategy,
+        val_labeling_mode=val_labeling_mode,
+        val_recent_window_horizon_days=val_recent_window_horizon_days,
     )
 
     print(
@@ -578,9 +738,10 @@ def run_case(
         ].head(10).to_string(index=False)
     )
     print("val shape:", val_feature_df.shape)
+    print("val label counts:", val_feature_df["label"].value_counts(dropna=False).sort_index().to_dict())
     print(
         val_feature_df[
-            ["serial_number", "date", "failure"]
+            ["serial_number", "date", "failure", "label"]
         ].head(10).to_string(index=False)
     )
 
@@ -605,6 +766,8 @@ def run_case(
 def main() -> None:
     train_df = load_data(TRAIN_PATH)
     val_df = load_data(VAL_PATH)
+    val_serial_number_id_df = load_data(VAL_SERIAL_NUMBER_ID_PATH)
+    val_label_df = load_data(VAL_LABEL_PATH)
     print("raw train shape:", train_df.shape)
     print("raw val shape:", val_df.shape)
 
@@ -612,11 +775,15 @@ def main() -> None:
         "default config",
         train_df,
         val_df,
+        val_serial_number_id_df,
+        val_label_df,
         window_size=30,
         censored_rul_value=9999,
         drop_censored=False,
         numeric_fill_strategy="median",
         categorical_fill_strategy="max",
+        val_labeling_mode="all_windows",
+        val_recent_window_horizon_days=None,
     )
 
     # run_case(
