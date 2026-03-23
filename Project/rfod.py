@@ -41,7 +41,9 @@ from badgers.generators.tabular_data.outliers import DecompositionAndOutlierGene
 from sklearn.utils import shuffle
 from numpy.random import default_rng
 
-base_dir = "/home/ruiyao/cs_5344/Project"
+# base_dir = "/home/ruiyao/cs_5344/Project"
+# base_dir = "/Users/ssdmry/Desktop/mry/新加坡/博士/课程/CS5344_Big Data Analytics/cs_5344/Project"
+base_dir = "/Users/dex/Documents/python-workspace/cs5344_RUL_Predictor/Project"
 parser = argparse.ArgumentParser(description="ndcg + std experiments")
 
 parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
@@ -67,6 +69,8 @@ os.makedirs(logs_all_folder, exist_ok=True)
 os.makedirs(logs_result_folder, exist_ok=True)
 stdout_file = os.path.join(logs_all_folder, f"{dataset_name}.txt")
 resout_file = os.path.join(logs_result_folder, f"{dataset_name}.txt")
+
+X = None
 
 
 def print_to_log(*args, **kwargs):
@@ -17775,6 +17779,89 @@ elif dataset_name == "backblaze":
     categ_cols = ["model"]
     num_cols = [col for col in X.columns if col not in categ_cols]
     target = "label"
+
+elif dataset_name == "backblaze_clean":
+    _bb_clean_dir    = os.path.join(base_dir, "Datasets/Backblaze/clean")
+    _bb_val_ids_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_serial_number_id.csv")
+    _bb_val_lbl_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_label.csv")
+
+    _bb_files      = sorted(os.listdir(_bb_clean_dir))
+    _bb_train_file = next(f for f in _bb_files if f.startswith("train_set"))
+    _bb_val_file   = next(f for f in _bb_files if f.startswith("val_set"))
+
+    _bb_train = pd.read_csv(os.path.join(_bb_clean_dir, _bb_train_file), low_memory=False)
+    _bb_val   = pd.read_csv(os.path.join(_bb_clean_dir, _bb_val_file),   low_memory=False)
+
+    # 只保留故障前 60 天的数据（与原始 backblaze 处理一致）
+    _bb_train = _bb_train[_bb_train["rul_days"] <= 60].reset_index(drop=True)
+
+    # 训练集：去掉 meta 列，提取特征和标签
+    _meta_cols  = {"date", "serial_number", "failure", "failure_date", "rul_days", "label"}
+    _feat_cols  = [c for c in _bb_train.columns if c not in _meta_cols]
+    X_bb_train  = _bb_train[_feat_cols].reset_index(drop=True)
+    y_bb_train  = _bb_train["label"].reset_index(drop=True)
+
+    # 验证集：取每个磁盘最后一行的滚动特征，join val_label.csv 获取标签
+    _bb_val["date"] = pd.to_datetime(_bb_val["date"], errors="coerce")
+    _bb_val_last = (
+        _bb_val.sort_values(["serial_number", "date"])
+               .drop_duplicates("serial_number", keep="last")
+    )
+    _bb_ids    = pd.read_csv(_bb_val_ids_path)
+    _bb_labels = pd.read_csv(_bb_val_lbl_path)
+    _bb_val_merged = (
+        _bb_val_last
+        .merge(_bb_ids,    on="serial_number", how="inner")
+        .merge(_bb_labels, on="id",            how="inner")
+    )
+    _val_feat_cols = [c for c in _feat_cols if c in _bb_val_merged.columns]
+    X_bb_val = _bb_val_merged[_val_feat_cols].reset_index(drop=True)
+    y_bb_val = _bb_val_merged["label"].astype(int).reset_index(drop=True)
+
+    X     = pd.concat([X_bb_train[_val_feat_cols], X_bb_val], ignore_index=True)
+    y_raw = pd.concat([y_bb_train, y_bb_val], ignore_index=True)
+
+    always_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    X = X.drop(columns=always_nan_cols)
+
+    y = (y_raw > 0).astype(int)
+
+    categ_cols = [c for c in ["model"] if c in X.columns]
+    num_cols   = [c for c in X.columns if c not in categ_cols]
+    target     = "label"
+
+elif dataset_name == "scania_clean":
+    _sc_clean_dir  = os.path.join(base_dir, "Datasets/SCANIA")
+    _sc_window     = 10
+    _sc_train = pd.read_csv(os.path.join(_sc_clean_dir, f"train_features_w{_sc_window}.csv"), low_memory=False)
+    _sc_val   = pd.read_csv(os.path.join(_sc_clean_dir, f"validation_features_w{_sc_window}.csv"), low_memory=False)
+
+    # 只保留维修过的车辆（in_study_repair == 1）
+    _sc_tte = pd.read_csv(os.path.join(_sc_clean_dir, "train_tte.csv"))
+    _repaired_ids = set(_sc_tte.loc[_sc_tte["in_study_repair"] == 1, "vehicle_id"])
+    _sc_train = _sc_train[_sc_train["vehicle_id"].isin(_repaired_ids)].reset_index(drop=True)
+
+    _meta_cols = {"vehicle_id", "time_step", "label"}
+    _feat_cols = [c for c in _sc_train.columns if c not in _meta_cols]
+
+    X_sc_train = _sc_train[_feat_cols].reset_index(drop=True)
+    y_sc_train = _sc_train["label"].reset_index(drop=True)
+
+    _val_feat_cols = [c for c in _feat_cols if c in _sc_val.columns]
+    X_sc_val = _sc_val[_val_feat_cols].reset_index(drop=True)
+    y_sc_val = _sc_val["label"].astype(int).reset_index(drop=True)
+
+    X     = pd.concat([X_sc_train[_val_feat_cols], X_sc_val], ignore_index=True)
+    y_raw = pd.concat([y_sc_train, y_sc_val], ignore_index=True)
+
+    always_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    X = X.drop(columns=always_nan_cols)
+
+    y = (y_raw > 0).astype(int)
+
+    categ_cols = [c for c in X.columns if c.startswith("Spec_")]
+    num_cols   = [c for c in X.columns if c not in categ_cols]
+    target     = "label"
 
 elif dataset_name == "scania":
     sc_train_ops_path   = "/home/ruiyao/cs_5344/Project/Datasets/SCANIA/train_operational_readouts.csv"
