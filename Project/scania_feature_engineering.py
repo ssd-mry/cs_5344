@@ -11,7 +11,7 @@ MIN_PERIODS = 3
 
 _cwd = Path(__file__).resolve().parent
 DATASETS_ROOT = _cwd / "Datasets" if (_cwd / "Datasets").exists() else _cwd.parent / "Datasets"
-SCANIA_DIR = DATASETS_ROOT / "SCANIA"
+SCANIA_DIR = DATASETS_ROOT / "SCANIA" / "SCANIA"
 
 # ── Helper Functions ────
 
@@ -68,27 +68,15 @@ def build_features(ops_df: pd.DataFrame, sensor_cols: list[str],
 
     grouped = ops_df.groupby("vehicle_id", sort=False)[sensor_cols]
 
-    # ── Vectorised rolling statistics ──
-    rolling_stats = grouped.rolling(window=w, min_periods=min_p).agg(
-        ["min", "max", "mean", "std"]
-    )
-    rolling_stats.columns = [f"{col}_{fn}" for col, fn in rolling_stats.columns]
+    # ── Vectorised rolling mean ──
+    rolling_stats = grouped.rolling(window=w, min_periods=min_p).mean()
+    rolling_stats.columns = [f"{col}_mean" for col in rolling_stats.columns]
     rolling_stats = rolling_stats.reset_index(level=0, drop=True)
-
-    # ── Slope ──
-    rolling_slope = grouped.rolling(window=w, min_periods=min_p).apply(
-        compute_slope, raw=True
-    )
-    rolling_slope = rolling_slope.reset_index(level=0, drop=True)
-    rolling_slope = rolling_slope.rename(
-        columns={col: f"{col}_slope" for col in sensor_cols}
-    )
 
     # ── Combine with identity columns ──
     features = pd.concat([
         ops_df[["vehicle_id", "time_step"]].reset_index(drop=True),
         rolling_stats.reset_index(drop=True),
-        rolling_slope.reset_index(drop=True),
     ], axis=1)
 
     return features
@@ -265,34 +253,23 @@ def main():
             pct = 100 * cnt / len(df)
             print(f"    class {lbl}: {cnt:>6,}  ({pct:.1f}%)")
 
-    # ── Step 5: Encode and merge vehicle specifications ──
-    print("\n[Step 5] Encoding vehicle specifications (one-hot) ...")
+    # ── Step 5: Merge vehicle specifications (raw categorical) ──
+    print("\n[Step 5] Merging vehicle specifications (raw categorical) ...")
     train_specs = pd.read_csv(SCANIA_DIR / "train_specifications.csv")
     val_specs   = pd.read_csv(SCANIA_DIR / "validation_specifications.csv")
     test_specs  = pd.read_csv(SCANIA_DIR / "test_specifications.csv")
 
-    # Patch missing categorical values with max (fit on train)
     spec_cols = sorted(c for c in train_specs.columns if c.startswith("Spec_"))
-    cat_fill = {col: train_specs[col].max() for col in spec_cols}
-    n_cat_patched = 0
+    cat_fill = {col: train_specs[col].mode()[0] for col in spec_cols}
     for specs_df in [train_specs, val_specs, test_specs]:
         for col in spec_cols:
-            n_missing = specs_df[col].isna().sum()
-            if n_missing > 0:
-                specs_df[col] = specs_df[col].fillna(cat_fill[col])
-                n_cat_patched += n_missing
-    print(f"  Categorical missing values patched (max): {n_cat_patched}")
+            specs_df[col] = specs_df[col].fillna(cat_fill[col])
 
-    train_specs_enc, spec_cats = encode_specifications(train_specs)
-    val_specs_enc, _           = encode_specifications(val_specs, spec_cats)
-    test_specs_enc, _          = encode_specifications(test_specs, spec_cats)
+    train_feat = train_feat.merge(train_specs[["vehicle_id"] + spec_cols], on="vehicle_id", how="left")
+    val_feat   = val_feat.merge(val_specs[["vehicle_id"] + spec_cols],   on="vehicle_id", how="left")
+    test_feat  = test_feat.merge(test_specs[["vehicle_id"] + spec_cols], on="vehicle_id", how="left")
 
-    train_feat = train_feat.merge(train_specs_enc, on="vehicle_id", how="left")
-    val_feat   = val_feat.merge(val_specs_enc, on="vehicle_id", how="left")
-    test_feat  = test_feat.merge(test_specs_enc, on="vehicle_id", how="left")
-
-    n_spec_cols = sum(len(v) for v in spec_cats.values())
-    print(f"  Added {n_spec_cols} one-hot specification columns")
+    print(f"  Added {len(spec_cols)} raw categorical specification columns: {spec_cols}")
 
     # ── Step 6: Save ──
     print("\n[Step 6] Saving feature datasets ...")
@@ -308,15 +285,15 @@ def main():
     print(f"  {out_val.name:40s}  {val_feat.shape}")
     print(f"  {out_test.name:40s}  {test_feat.shape}")
 
-#summary
-    n_sensor_feats = len(sensor_cols) * 5
+    # summary
+    n_sensor_feats = len(sensor_cols)
     print(f"\n{'─' * 64}")
     print(f"  Features per row:")
-    print(f"    {len(sensor_cols)} sensors × 5 aggregations (min/max/mean/std/slope) = {n_sensor_feats}")
-    print(f"    + {n_spec_cols} specification one-hot columns")
+    print(f"    {len(sensor_cols)} sensors × 1 aggregation (mean) = {n_sensor_feats}")
+    print(f"    + {len(spec_cols)} raw categorical specification columns")
     print(f"    + 2 identity columns (vehicle_id, time_step)")
     print(f"    + 1 label column (train/val only)")
-    print(f"    = {n_sensor_feats + n_spec_cols + 2 + 1} total columns (train/val)")
+    print(f"    = {n_sensor_feats + len(spec_cols) + 2 + 1} total columns (train/val)")
     print(f"\n  Total time: {time.time() - t_start:.1f}s")
     print("  Done!")
 
