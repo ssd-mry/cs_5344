@@ -7,7 +7,7 @@ import time
 
 # ── Configuration ────
 WINDOW_SIZE = 10
-MIN_PERIODS = 3
+MIN_PERIODS = 1
 
 _cwd = Path(__file__).resolve().parent
 DATASETS_ROOT = _cwd / "Datasets" if (_cwd / "Datasets").exists() else _cwd.parent / "Datasets"
