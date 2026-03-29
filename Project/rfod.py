@@ -17827,6 +17827,27 @@ elif dataset_name == "backblaze_clean":
     num_cols   = [c for c in X.columns if c not in categ_cols]
     target     = "label"
 
+    # For feature agg
+    _agg_feat_cols       = list(X.columns)
+    _orig_id_cols        = ["serial_number", "date", "rul_days"]
+    _orig_train_csv_path = os.path.join(_bb_clean_dir, _bb_train_file)
+
+    _bb_val_full = pd.read_csv(os.path.join(_bb_clean_dir, _bb_val_file), low_memory=False)
+    _bb_val_full["date"] = pd.to_datetime(_bb_val_full["date"], errors="coerce")
+    _bb_val_label_map = (
+        _bb_val_full.sort_values(["serial_number", "date"])
+        .drop_duplicates("serial_number", keep="last")
+        .merge(_bb_ids,    on="serial_number", how="inner")
+        .merge(_bb_labels, on="id",            how="inner")
+        [["serial_number", "label"]].rename(columns={"label": "_lbl"})
+    )
+    _bb_val_full = _bb_val_full.merge(_bb_val_label_map, on="serial_number", how="left")
+    _bb_val_full["label"] = _bb_val_full["_lbl"].fillna(-1).astype(int)
+    _orig_val_df = _bb_val_full.drop(columns=["_lbl"], errors="ignore").copy().reset_index(drop=True)
+
+    _orig_train_agg_path = os.path.join(_bb_clean_dir, "backblaze_clean_train_feature_agg.csv")
+    _orig_val_agg_path   = os.path.join(_bb_clean_dir, "backblaze_clean_val_feature_agg.csv")
+
 elif dataset_name == "scania":
     sc_train_ops_path   = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_operational_readouts.csv")
     sc_train_spec_path  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_specifications.csv")
@@ -17928,17 +17949,29 @@ elif dataset_name == "scania_clean":
     num_cols   = [c for c in X.columns if c not in categ_cols]
     target     = "label"
 
+    # For feature agg
+    _agg_feat_cols       = list(X.columns)
+    _orig_id_cols        = ["vehicle_id", "time_step"]
+    _orig_train_csv_path = os.path.join(_sc_clean_dir, f"train_features_w{_sc_window}.csv")
+    _orig_val_df         = _sc_val.copy().reset_index(drop=True)
+    _orig_train_agg_path = os.path.join(_sc_clean_dir, f"train_features_w{_sc_window}_agg.csv")
+    _orig_val_agg_path   = os.path.join(_sc_clean_dir, f"validation_features_w{_sc_window}_agg.csv")
+
 X = X.replace("?", np.nan)
 # y = data[target]
 print(X.columns)
 print("X shape: ", X.shape)
+_label_encoders = {}
+_num_medians = {}
 for col in X.columns:
     if col in categ_cols:
         X[col] = X[col].fillna(X[col].mode()[0])
         le = LabelEncoder()
         X[col] = le.fit_transform(X[col])
+        _label_encoders[col] = le
     else:
-        X[col] = X[col].fillna(X[col].median())
+        _num_medians[col] = X[col].median()
+        X[col] = X[col].fillna(_num_medians[col])
 
 print("Number of categorical columns: ", len(categ_cols))
 print("Number of numerical columns: ", len(num_cols))
@@ -17992,9 +18025,11 @@ X_processed_valid = pd.DataFrame()
 X_processed_test = pd.DataFrame()
 
 process_list = {}
+_onehot_encoders = {}
 for col_name in categ_cols:
     encoder = OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore")
     onehot_col_train = encoder.fit_transform(X_train[[col_name]])
+    _onehot_encoders[col_name] = encoder
     onehot_col_valid = encoder.transform(X_valid[[col_name]])
     onehot_col_test = encoder.transform(X_test[[col_name]])
     process_list[col_name] = [f"{col_name}_{cat}" for cat in encoder.categories_[0][1:]]
@@ -18487,7 +18522,131 @@ with open(out_path, "w") as f:
     json.dump(anomaly_results, f, indent=2)
 
 print(f"[RFOD-Unsupervised] Anomaly IDs saved to: {out_path}")
+sys.stdout.flush()
+sys.stderr = sys.stdout  # redirect stderr to log so exceptions are visible
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Save feature-augmented train/val CSVs with anomaly_score (best alpha)
+# ──────────────────────────────────────────────────────────────────────────────
+if dataset_name in ("backblaze_clean", "scania_clean"):
+
+    def _safe_le_transform(le, values):
+        """Vectorized LabelEncode; map unseen categories to -1."""
+        arr = np.asarray(values)
+        known_mask = np.array([v in set(le.classes_) for v in arr])
+        result = np.full(len(arr), -1, dtype=np.int64)
+        if known_mask.any():
+            result[known_mask] = le.transform(arr[known_mask])
+        return result
+
+    def _preprocess_for_scoring(df_orig):
+        """Apply same preprocessing pipeline (LabelEncode + StandardScale) as training."""
+        df = df_orig[_agg_feat_cols].copy().replace("?", np.nan)
+        for col in _agg_feat_cols:
+            if col in categ_cols:
+                fill = df[col].mode()
+                df[col] = df[col].fillna(fill[0] if len(fill) > 0 else 0)
+                df[col] = _safe_le_transform(_label_encoders[col], df[col].values)
+            else:
+                df[col] = df[col].fillna(_num_medians.get(col, 0))
+        df.reset_index(drop=True, inplace=True)
+
+        X_proc = pd.DataFrame()
+        for col_name in categ_cols:
+            ohe_vals = _onehot_encoders[col_name].transform(df[[col_name]])
+            X_proc = pd.concat([X_proc, pd.DataFrame(ohe_vals, columns=process_list[col_name])], axis=1)
+        _nc = [c for c in num_cols if c in _agg_feat_cols]
+        X_num_sc = pd.DataFrame(scaler.transform(df[_nc]), columns=_nc)
+        X_proc = pd.concat([X_proc, X_num_sc], axis=1)
+        X_proc.reset_index(drop=True, inplace=True)
+        return df, X_proc
+
+    def _compute_anomaly_scores(X_raw, X_proc, alpha_val):
+        """Score rows in X_raw using trained RFOD models."""
+        global X_processed_test
+        _saved_proc = X_processed_test
+        X_processed_test = X_proc
+
+        _Conf = {}
+        for _col in X_train.columns:
+            if _col in fitonly or _col not in X_raw.columns:
+                continue
+            _Conf[_col] = predict(
+                _col, Feature_tree_used[_col],
+                X_raw[_col].values, Tid[_col], rFM[_col], num_cols,
+            )
+
+        X_processed_test = _saved_proc
+
+        _pcols = [c for c in X_train.columns if c not in fitonly and c in X_raw.columns]
+        _conf  = pd.DataFrame({c: _Conf[c]["confidence_scores"] for c in _pcols})[_pcols]
+        _pred  = pd.DataFrame({c: _Conf[c]["final_pred"]        for c in _pcols})[_pcols]
+
+        _fw = _conf.to_numpy().copy()
+        for i in range(_fw.shape[0]):
+            s = _fw[i].sum()
+            if s != 0:
+                _fw[i] /= s
+        _fw = 1 - _fw
+        for i in range(_fw.shape[0]):
+            s = _fw[i].sum()
+            if s != 0:
+                _fw[i] /= s
+        _fw = np.square(_fw)
+        _fw = _fw / np.sum(_fw, axis=1, keepdims=True)
+
+        _cat_idx = [i for i, c in enumerate(X_raw.columns) if c in categ_cols]
+        _num_idx = [i for i, c in enumerate(X_raw.columns) if c in num_cols]
+        _res = alphaquantile(
+            _pred.values, X_raw.values,
+            _cat_idx, _num_idx, X_raw.columns,
+            _fw, residual, weighted=weighted,
+        )
+        _, _scores = _res[alpha_val]
+        return _scores
+
+    def _score_csv_chunked(csv_path, out_path, id_cols, chunk_size=5000):
+        """Read csv_path in chunks, score each chunk, stream-write to out_path."""
+        first = True
+        total = 0
+        for _chunk in pd.read_csv(csv_path, chunksize=chunk_size, low_memory=False):
+            _xr, _xp = _preprocess_for_scoring(_chunk)
+            _chunk["anomaly_score"] = _compute_anomaly_scores(_xr, _xp, best_aucroc_alpha)
+            _chunk.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
+            first = False
+            total += len(_chunk)
+            print(f"  [Feature Agg] train processed {total} rows")
+            sys.stdout.flush()
+        return total
+
+    try:
+        print(f"[Feature Agg] Best alpha = {best_aucroc_alpha}")
+        sys.stdout.flush()
+
+        # Train CSV — chunked (may be very large)
+        print(f"[Feature Agg] Scoring train CSV (chunked): {_orig_train_csv_path}")
+        sys.stdout.flush()
+        _n_train = _score_csv_chunked(_orig_train_csv_path, _orig_train_agg_path, _orig_id_cols)
+        print(f"[Feature Agg] Train saved: {_n_train} rows → {_orig_train_agg_path}")
+        sys.stdout.flush()
+
+        # Val CSV — at once (small)
+        print("[Feature Agg] Scoring val CSV...")
+        sys.stdout.flush()
+        _val_raw, _val_proc = _preprocess_for_scoring(_orig_val_df)
+        _val_scores = _compute_anomaly_scores(_val_raw, _val_proc, best_aucroc_alpha)
+        _out_val = _orig_val_df.copy()
+        _out_val["anomaly_score"] = _val_scores
+        _out_val.to_csv(_orig_val_agg_path, index=False)
+        print(f"[Feature Agg] Val   saved: {_out_val.shape[0]} rows → {_orig_val_agg_path}")
+        sys.stdout.flush()
+
+    except Exception as _e:
+        import traceback
+        print(f"[Feature Agg] ERROR: {_e}")
+        traceback.print_exc()
+        sys.stdout.flush()
 
 
 sys.stdout.close()
