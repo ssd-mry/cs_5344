@@ -18821,7 +18821,7 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         print("[Feature Agg] Scoring val CSV...")
         sys.stdout.flush()
         _val_raw0, _val_proc0 = _preprocess_for_scoring(_orig_val_df)
-        _out_val = _orig_val_df.copy()
+        _out_val = _orig_val_df.drop(columns=["label"], errors="ignore").copy()
         _out_val["anomaly_score_0"] = _compute_anomaly_scores(_val_raw0, _val_proc0, best_aucroc_alpha)
         for _k, _arts in _extra_models.items():
             _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k = _arts
