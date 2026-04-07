@@ -18527,7 +18527,8 @@ sys.stderr = sys.stdout  # redirect stderr to log so exceptions are visible
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Save feature-augmented train/val CSVs with anomaly_score (best alpha)
+# Save feature-augmented train/val CSVs with multi-threshold anomaly scores
+# anomaly_score_k: labels 0..k treated as normal, labels > k treated as anomaly
 # ──────────────────────────────────────────────────────────────────────────────
 if dataset_name in ("backblaze_clean", "scania_clean"):
 
@@ -18563,7 +18564,7 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         return df, X_proc
 
     def _compute_anomaly_scores(X_raw, X_proc, alpha_val):
-        """Score rows in X_raw using trained RFOD models."""
+        """Score rows in X_raw using the original (k=0) trained RFOD models."""
         global X_processed_test
         _saved_proc = X_processed_test
         X_processed_test = X_proc
@@ -18606,13 +18607,180 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         _, _scores = _res[alpha_val]
         return _scores
 
+    def _retrain_for_threshold(k):
+        """Retrain RFOD treating y_raw <= k as normal, y_raw > k as anomaly.
+        Temporarily overrides training globals, then restores them.
+        Returns (Ftree_k, rFM_k, Tid_k, resid_k, scaler_k, ohe_k, plist_k).
+        """
+        global X_processed_train, X_processed_valid, X_processed_test
+        global X_train, X_valid, X_test, process_list
+
+        _y_k = pd.Series((y_raw.values > k).astype(int), index=X.index)
+
+        # Split: normal-only for train/valid, mix for test
+        _Xtr = X[_y_k == 0].sample(frac=0.6, random_state=42)
+        _Xvl = _Xtr.sample(frac=0.1 / 0.6, random_state=42)
+        _Xtr_rest = X[_y_k == 0].drop(_Xtr.index)
+        _Xte = pd.concat([_Xtr_rest, X[_y_k == 1]])
+
+        # Apply sample_frac consistent with original training
+        _Xtr = _Xtr.sample(frac=sample_frac, random_state=42)
+        _Xvl = _Xvl.sample(frac=sample_frac, random_state=42)
+
+        _Xtr = _Xtr.reset_index(drop=True)
+        _Xvl = _Xvl.reset_index(drop=True)
+        _Xte = _Xte.reset_index(drop=True)
+
+        # OHE for categorical cols (refit on new X_train_k)
+        _plist_k = {}
+        _ohe_k = {}
+        _Xp_tr = pd.DataFrame()
+        _Xp_vl = pd.DataFrame()
+        _Xp_te = pd.DataFrame()
+        for _c in categ_cols:
+            _enc = OneHotEncoder(drop="first", sparse_output=False, handle_unknown="ignore")
+            _tr_ohe = _enc.fit_transform(_Xtr[[_c]])
+            _ohe_k[_c] = _enc
+            _plist_k[_c] = [f"{_c}_{cat}" for cat in _enc.categories_[0][1:]]
+            _Xp_tr = pd.concat([_Xp_tr, pd.DataFrame(_tr_ohe,                       columns=_plist_k[_c])], axis=1)
+            _Xp_vl = pd.concat([_Xp_vl, pd.DataFrame(_enc.transform(_Xvl[[_c]]),   columns=_plist_k[_c])], axis=1)
+            _Xp_te = pd.concat([_Xp_te, pd.DataFrame(_enc.transform(_Xte[[_c]]),   columns=_plist_k[_c])], axis=1)
+
+        # process_list entries for numerical cols (mirrors line 18043-18044)
+        for _c in num_cols:
+            _plist_k[_c] = [_c]
+
+        # Scale numerical cols (refit StandardScaler on new X_train_k)
+        _sc_k = StandardScaler()
+        _nc_k = [c for c in num_cols if c in _Xtr.columns]
+        _Xp_tr = pd.concat([_Xp_tr, pd.DataFrame(_sc_k.fit_transform(_Xtr[_nc_k]),  columns=_nc_k)], axis=1)
+        _Xp_vl = pd.concat([_Xp_vl, pd.DataFrame(_sc_k.transform(_Xvl[_nc_k]),      columns=_nc_k)], axis=1)
+        _Xp_te = pd.concat([_Xp_te, pd.DataFrame(_sc_k.transform(_Xte[_nc_k]),      columns=_nc_k)], axis=1)
+        _Xp_tr.reset_index(drop=True, inplace=True)
+        _Xp_vl.reset_index(drop=True, inplace=True)
+        _Xp_te.reset_index(drop=True, inplace=True)
+
+        # Save current globals, override with threshold-k data
+        _sv = (X_processed_train, X_processed_valid, X_processed_test,
+               X_train, X_valid, X_test, process_list)
+        X_processed_train = _Xp_tr
+        X_processed_valid = _Xp_vl
+        X_processed_test  = _Xp_te
+        X_train = _Xtr
+        X_valid = _Xvl
+        X_test  = _Xte
+        process_list = _plist_k
+
+        # Retrain RFOD per feature
+        # NOTE: use 'col_name' as loop variable (not '_col') because tree_scoring /
+        # trees_scoring reference the global 'col_name' to decide regression vs classification.
+        global col_name
+        _Ftree_k, _rFM_k, _Tid_k = {}, {}, {}
+        for col_name in X_train.columns:
+            if col_name in fitonly:
+                continue
+            _r = train_rf(col_name, num_cols, categ_cols)
+            _Tid_k[col_name]   = _r["tree_indices"]
+            _rFM_k[col_name]   = _r["rf_model"]
+            _Ftree_k[col_name] = _r["tree_used"]
+
+        # Compute residuals on new validation set
+        _resid_k = {}
+        for _col in num_cols:
+            if _col in fitonly:
+                continue
+            _resid_k[_col] = np.sort(calc_resi(
+                _col, X_processed_valid,
+                _Tid_k[_col][: _Ftree_k[_col]], _rFM_k[_col],
+            ))
+
+        # Restore globals
+        (X_processed_train, X_processed_valid, X_processed_test,
+         X_train, X_valid, X_test, process_list) = _sv
+
+        return _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k
+
+    def _preprocess_for_scoring_k(df_orig, sc_k, ohe_k, plist_k):
+        """Preprocess using threshold-k scaler/encoders (LabelEncode same as base)."""
+        df = df_orig[_agg_feat_cols].copy().replace("?", np.nan)
+        for col in _agg_feat_cols:
+            if col in categ_cols:
+                fill = df[col].mode()
+                df[col] = df[col].fillna(fill[0] if len(fill) > 0 else 0)
+                df[col] = _safe_le_transform(_label_encoders[col], df[col].values)
+            else:
+                df[col] = df[col].fillna(_num_medians.get(col, 0))
+        df.reset_index(drop=True, inplace=True)
+
+        X_proc = pd.DataFrame()
+        for col_name in categ_cols:
+            ohe_vals = ohe_k[col_name].transform(df[[col_name]])
+            X_proc = pd.concat([X_proc, pd.DataFrame(ohe_vals, columns=plist_k[col_name])], axis=1)
+        _nc = [c for c in num_cols if c in _agg_feat_cols]
+        X_num_sc = pd.DataFrame(sc_k.transform(df[_nc]), columns=_nc)
+        X_proc = pd.concat([X_proc, X_num_sc], axis=1)
+        X_proc.reset_index(drop=True, inplace=True)
+        return df, X_proc
+
+    def _compute_anomaly_scores_k(X_raw, X_proc, alpha_val, Ftree_k, rFM_k, Tid_k, resid_k):
+        """Score rows using threshold-k RFOD models (no global mutation of models)."""
+        global X_processed_test
+        _saved_proc = X_processed_test
+        X_processed_test = X_proc
+
+        _Conf = {}
+        for _col in X_raw.columns:
+            if _col in fitonly or _col not in Ftree_k:
+                continue
+            _Conf[_col] = predict(
+                _col, Ftree_k[_col],
+                X_raw[_col].values, Tid_k[_col], rFM_k[_col], num_cols,
+            )
+
+        X_processed_test = _saved_proc
+
+        _pcols = [c for c in X_raw.columns if c not in fitonly and c in Ftree_k]
+        _conf  = pd.DataFrame({c: _Conf[c]["confidence_scores"] for c in _pcols})[_pcols]
+        _pred  = pd.DataFrame({c: _Conf[c]["final_pred"]        for c in _pcols})[_pcols]
+
+        _fw = _conf.to_numpy().copy()
+        for i in range(_fw.shape[0]):
+            s = _fw[i].sum()
+            if s != 0:
+                _fw[i] /= s
+        _fw = 1 - _fw
+        for i in range(_fw.shape[0]):
+            s = _fw[i].sum()
+            if s != 0:
+                _fw[i] /= s
+        _fw = np.square(_fw)
+        _fw = _fw / np.sum(_fw, axis=1, keepdims=True)
+
+        _cat_idx = [i for i, c in enumerate(X_raw.columns) if c in categ_cols]
+        _num_idx = [i for i, c in enumerate(X_raw.columns) if c in num_cols]
+        _res = alphaquantile(
+            _pred.values, X_raw.values,
+            _cat_idx, _num_idx, X_raw.columns,
+            _fw, resid_k, weighted=weighted,
+        )
+        _, _scores = _res[alpha_val]
+        return _scores
+
     def _score_csv_chunked(csv_path, out_path, id_cols, chunk_size=5000):
-        """Read csv_path in chunks, score each chunk, stream-write to out_path."""
+        """Read csv_path in chunks, score with all threshold models, stream-write to out_path."""
         first = True
         total = 0
         for _chunk in pd.read_csv(csv_path, chunksize=chunk_size, low_memory=False):
-            _xr, _xp = _preprocess_for_scoring(_chunk)
-            _chunk["anomaly_score"] = _compute_anomaly_scores(_xr, _xp, best_aucroc_alpha)
+            # k=0: use original trained models
+            _xr0, _xp0 = _preprocess_for_scoring(_chunk)
+            _chunk["anomaly_score_0"] = _compute_anomaly_scores(_xr0, _xp0, best_aucroc_alpha)
+            # k>=1: use retrained threshold-k models
+            for _k, _arts in _extra_models.items():
+                _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k = _arts
+                _xrk, _xpk = _preprocess_for_scoring_k(_chunk, _sc_k, _ohe_k, _plist_k)
+                _chunk[f"anomaly_score_{_k}"] = _compute_anomaly_scores_k(
+                    _xrk, _xpk, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k
+                )
             _chunk.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
             first = False
             total += len(_chunk)
@@ -18624,6 +18792,24 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         print(f"[Feature Agg] Best alpha = {best_aucroc_alpha}")
         sys.stdout.flush()
 
+        # Determine all label thresholds from y_raw
+        # e.g. labels [0,1,2,3,4] → thresholds [0,1,2,3] (exclude max: no anomalies left)
+        _all_label_vals = sorted(int(v) for v in y_raw.unique() if pd.notna(v))
+        _score_thresholds = _all_label_vals[:-1]
+        print(f"[Feature Agg] Label values: {_all_label_vals}  →  score thresholds: {_score_thresholds}")
+        sys.stdout.flush()
+
+        # Retrain for thresholds k >= 1 (k=0 uses the already-trained globals)
+        _extra_models = {}
+        for _k in _score_thresholds:
+            if _k == 0:
+                continue
+            print(f"[Feature Agg] Retraining RFOD for threshold k={_k} (normal = labels 0..{_k})...")
+            sys.stdout.flush()
+            _extra_models[_k] = _retrain_for_threshold(_k)
+            print(f"[Feature Agg] Retraining done for k={_k}")
+            sys.stdout.flush()
+
         # Train CSV — chunked (may be very large)
         print(f"[Feature Agg] Scoring train CSV (chunked): {_orig_train_csv_path}")
         sys.stdout.flush()
@@ -18634,10 +18820,15 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         # Val CSV — at once (small)
         print("[Feature Agg] Scoring val CSV...")
         sys.stdout.flush()
-        _val_raw, _val_proc = _preprocess_for_scoring(_orig_val_df)
-        _val_scores = _compute_anomaly_scores(_val_raw, _val_proc, best_aucroc_alpha)
+        _val_raw0, _val_proc0 = _preprocess_for_scoring(_orig_val_df)
         _out_val = _orig_val_df.copy()
-        _out_val["anomaly_score"] = _val_scores
+        _out_val["anomaly_score_0"] = _compute_anomaly_scores(_val_raw0, _val_proc0, best_aucroc_alpha)
+        for _k, _arts in _extra_models.items():
+            _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k = _arts
+            _val_rawK, _val_procK = _preprocess_for_scoring_k(_orig_val_df, _sc_k, _ohe_k, _plist_k)
+            _out_val[f"anomaly_score_{_k}"] = _compute_anomaly_scores_k(
+                _val_rawK, _val_procK, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k
+            )
         _out_val.to_csv(_orig_val_agg_path, index=False)
         print(f"[Feature Agg] Val   saved: {_out_val.shape[0]} rows → {_orig_val_agg_path}")
         sys.stdout.flush()
