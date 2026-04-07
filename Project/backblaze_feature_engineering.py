@@ -44,6 +44,7 @@ DEFAULT_VALIDATION_LABEL_MIDPOINTS = {
     2: 5,
 }
 
+
 def _validate_required_columns(
     df: pd.DataFrame,
     required_columns: Sequence[str] = REQUIRED_COLUMNS,
@@ -292,6 +293,8 @@ def clean_train_val_datasets(
 
     clean_train_df = train_df.loc[:, report.kept_columns].copy()
     clean_val_df = val_df.reindex(columns=report.kept_columns).copy()
+    print("shape of clean_train_df: ", clean_train_df.shape)
+    print("shape of clean_val_df: ", clean_val_df.shape)
 
     fill_values = compute_fill_values(
         clean_train_df,
@@ -512,7 +515,8 @@ def generate_validation_labels(
     - ``final_only``: keep only the last window per disk
     - ``recent_windows``: keep windows within ``recent_window_horizon_days`` of the prediction date
       and estimate historical labels using midpoint-based proxy RUL
-    - ``all_windows``: estimate labels for every window using midpoint-based proxy RUL
+    - ``all_windows``: copy the disk-level validation label to every window
+    - ``midpoint``: estimate labels for every window using midpoint-based proxy RUL
     """
     required_mapping_columns = {"id", "serial_number"}
     required_label_columns = {"id", "label"}
@@ -523,7 +527,7 @@ def generate_validation_labels(
     if not required_label_columns.issubset(val_label_df.columns):
         raise ValueError("val_label_df must contain columns: ['id', 'label']")
 
-    valid_modes = {"final_only", "recent_windows", "all_windows"}
+    valid_modes = {"final_only", "recent_windows", "all_windows", "midpoint"}
     if labeling_mode not in valid_modes:
         raise ValueError(f"labeling_mode must be one of {sorted(valid_modes)}")
 
@@ -577,6 +581,8 @@ def generate_validation_labels(
 
     if labeling_mode == "final_only":
         labeled_val_df["label"] = labeled_val_df["label_final"]
+    elif labeling_mode == "all_windows":
+        labeled_val_df["label"] = labeled_val_df["label_final"]
     else:
         labeled_val_df["proxy_rul_est"] = (
             labeled_val_df["label_final"].map(midpoint_map).astype("int64")
@@ -600,7 +606,6 @@ def generate_validation_labels(
         )
 
     return labeled_val_df
-
 
 
 def build_train_val_feature_datasets(
@@ -672,7 +677,6 @@ def build_train_val_feature_datasets(
         )
 
     return train_feature_df, val_feature_df, report
-
 
 def load_data(path: str, nrows: int | None = None) -> pd.DataFrame:
     return pd.read_csv(path, nrows=nrows)
