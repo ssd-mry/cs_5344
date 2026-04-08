@@ -1,5 +1,5 @@
-X_train shape: (14950, 113)
-X_test shape: (59045, 113)
+X_train shape: (14950, 615)
+X_test shape: (59045, 615)
 y_train shape: (49834,)
 y_test shape: (59045,)
 y_test_positive_rate: 0.43734439834024896

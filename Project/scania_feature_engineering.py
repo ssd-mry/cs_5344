@@ -11,7 +11,7 @@ MIN_PERIODS = 1
 
 _cwd = Path(__file__).resolve().parent
 DATASETS_ROOT = _cwd / "Datasets" if (_cwd / "Datasets").exists() else _cwd.parent / "Datasets"
-SCANIA_DIR = DATASETS_ROOT / "SCANIA" / "SCANIA"
+SCANIA_DIR = DATASETS_ROOT / "SCANIA" 
 
 # ── Helper Functions ────
 

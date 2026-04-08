@@ -41,7 +41,23 @@ from badgers.generators.tabular_data.outliers import DecompositionAndOutlierGene
 from sklearn.utils import shuffle
 from numpy.random import default_rng
 
-base_dir = "/home/ruiyao/cs_5344/Project"
+# Project root (directory containing this file); override with env RFOD_PROJECT_DIR if needed.
+base_dir = os.environ.get(
+    "RFOD_PROJECT_DIR", os.path.dirname(os.path.abspath(__file__))
+)
+
+
+def _scania_data_dir() -> str:
+    """SCANIA CSVs may live in ``Datasets/SCANIA`` or nested ``Datasets/SCANIA/SCANIA``."""
+    flat = os.path.join(base_dir, "Datasets", "SCANIA")
+    nested = os.path.join(flat, "SCANIA")
+    if os.path.isfile(os.path.join(flat, "train_tte.csv")):
+        return flat
+    if os.path.isfile(os.path.join(nested, "train_tte.csv")):
+        return nested
+    return flat
+
+
 parser = argparse.ArgumentParser(description="ndcg + std experiments")
 
 parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
@@ -17849,12 +17865,13 @@ elif dataset_name == "backblaze_clean":
     _orig_val_agg_path   = os.path.join(_bb_clean_dir, "backblaze_clean_val_feature_agg.csv")
 
 elif dataset_name == "scania":
-    sc_train_ops_path   = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_operational_readouts.csv")
-    sc_train_spec_path  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_specifications.csv")
-    sc_train_tte_path   = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/train_tte.csv")
-    sc_val_ops_path     = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_operational_readouts.csv")
-    sc_val_spec_path    = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_specifications.csv")
-    sc_val_labels_path  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA/validation_labels.csv")
+    _sd = _scania_data_dir()
+    sc_train_ops_path   = os.path.join(_sd, "train_operational_readouts.csv")
+    sc_train_spec_path  = os.path.join(_sd, "train_specifications.csv")
+    sc_train_tte_path   = os.path.join(_sd, "train_tte.csv")
+    sc_val_ops_path     = os.path.join(_sd, "validation_operational_readouts.csv")
+    sc_val_spec_path    = os.path.join(_sd, "validation_specifications.csv")
+    sc_val_labels_path  = os.path.join(_sd, "validation_labels.csv")
 
     def _sc_last_readout(df_ops):
         df_ops = df_ops.sort_values(["vehicle_id", "time_step"])
@@ -17917,15 +17934,56 @@ elif dataset_name == "scania":
     target = "y"
 
 elif dataset_name == "scania_clean":
-    _sc_clean_dir  = os.path.join(base_dir, "Datasets/SCANIA/SCANIA")
+    _sc_clean_dir  = _scania_data_dir()
     _sc_window     = 10
-    _sc_train = pd.read_csv(os.path.join(_sc_clean_dir, f"train_features_w{_sc_window}.csv"), low_memory=False)
-    _sc_val   = pd.read_csv(os.path.join(_sc_clean_dir, f"validation_features_w{_sc_window}.csv"), low_memory=False)
+
+    def _read_csv_with_heartbeat(_csv_path, _tag, _chunk_size=200000):
+        _t0 = time.time()
+        print(f"[Heartbeat] START reading {_tag}: {_csv_path}")
+        sys.stdout.flush()
+        _chunks = []
+        _rows = 0
+        for _i, _chunk in enumerate(
+            pd.read_csv(_csv_path, low_memory=False, chunksize=_chunk_size), start=1
+        ):
+            _chunks.append(_chunk)
+            _rows += len(_chunk)
+            print(
+                f"[Heartbeat] {_tag} chunk={_i} rows={_rows} elapsed={time.time() - _t0:.1f}s"
+            )
+            sys.stdout.flush()
+        _df = pd.concat(_chunks, ignore_index=True) if _chunks else pd.DataFrame()
+        print(
+            f"[Heartbeat] DONE reading {_tag}: rows={_df.shape[0]} cols={_df.shape[1]} elapsed={time.time() - _t0:.1f}s"
+        )
+        sys.stdout.flush()
+        return _df
+
+    _sc_train = _read_csv_with_heartbeat(
+        os.path.join(_sc_clean_dir, f"train_features_w{_sc_window}.csv"),
+        "scania_clean_train_features",
+    )
+    _sc_val = _read_csv_with_heartbeat(
+        os.path.join(_sc_clean_dir, f"validation_features_w{_sc_window}.csv"),
+        "scania_clean_validation_features",
+    )
 
     # 只保留维修过的车辆（in_study_repair == 1）
+    print("[Heartbeat] START reading scania_clean_train_tte")
+    sys.stdout.flush()
     _sc_tte = pd.read_csv(os.path.join(_sc_clean_dir, "train_tte.csv"))
+    print(
+        f"[Heartbeat] DONE reading scania_clean_train_tte: rows={_sc_tte.shape[0]} cols={_sc_tte.shape[1]}"
+    )
+    sys.stdout.flush()
     _repaired_ids = set(_sc_tte.loc[_sc_tte["in_study_repair"] == 1, "vehicle_id"])
+    print(f"[Heartbeat] repaired vehicle ids={len(_repaired_ids)}")
+    sys.stdout.flush()
     _sc_train = _sc_train[_sc_train["vehicle_id"].isin(_repaired_ids)].reset_index(drop=True)
+    print(
+        f"[Heartbeat] AFTER repaired filter: train_rows={_sc_train.shape[0]} cols={_sc_train.shape[1]}"
+    )
+    sys.stdout.flush()
 
     _meta_cols = {"vehicle_id", "time_step", "label"}
     _feat_cols = [c for c in _sc_train.columns if c not in _meta_cols]
