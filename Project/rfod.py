@@ -41,7 +41,7 @@ from badgers.generators.tabular_data.outliers import DecompositionAndOutlierGene
 from sklearn.utils import shuffle
 from numpy.random import default_rng
 
-base_dir = "/Users/ssdmry/Desktop/mry/新加坡/博士/课程/CS5344_Big Data Analytics/cs_5344/Project"
+base_dir = "/home/ruiyao/cs_5344/Project"
 parser = argparse.ArgumentParser(description="ndcg + std experiments")
 
 parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
@@ -18722,11 +18722,14 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
         X_proc.reset_index(drop=True, inplace=True)
         return df, X_proc
 
-    def _compute_anomaly_scores_k(X_raw, X_proc, alpha_val, Ftree_k, rFM_k, Tid_k, resid_k):
+    def _compute_anomaly_scores_k(X_raw, X_proc, alpha_val, Ftree_k, rFM_k, Tid_k, resid_k, plist_k=None):
         """Score rows using threshold-k RFOD models (no global mutation of models)."""
-        global X_processed_test
+        global X_processed_test, process_list
         _saved_proc = X_processed_test
+        _saved_plist = process_list
         X_processed_test = X_proc
+        if plist_k is not None:
+            process_list = plist_k
 
         _Conf = {}
         for _col in X_raw.columns:
@@ -18738,6 +18741,7 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
             )
 
         X_processed_test = _saved_proc
+        process_list = _saved_plist
 
         _pcols = [c for c in X_raw.columns if c not in fitonly and c in Ftree_k]
         _conf  = pd.DataFrame({c: _Conf[c]["confidence_scores"] for c in _pcols})[_pcols]
@@ -18779,7 +18783,7 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
                 _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k = _arts
                 _xrk, _xpk = _preprocess_for_scoring_k(_chunk, _sc_k, _ohe_k, _plist_k)
                 _chunk[f"anomaly_score_{_k}"] = _compute_anomaly_scores_k(
-                    _xrk, _xpk, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k
+                    _xrk, _xpk, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k, _plist_k
                 )
             _chunk.to_csv(out_path, mode="w" if first else "a", header=first, index=False)
             first = False
