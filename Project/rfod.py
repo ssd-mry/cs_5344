@@ -18831,7 +18831,7 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
             _Ftree_k, _rFM_k, _Tid_k, _resid_k, _sc_k, _ohe_k, _plist_k = _arts
             _val_rawK, _val_procK = _preprocess_for_scoring_k(_orig_val_df, _sc_k, _ohe_k, _plist_k)
             _out_val[f"anomaly_score_{_k}"] = _compute_anomaly_scores_k(
-                _val_rawK, _val_procK, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k
+                _val_rawK, _val_procK, best_aucroc_alpha, _Ftree_k, _rFM_k, _Tid_k, _resid_k, _plist_k
             )
         _out_val.to_csv(_orig_val_agg_path, index=False)
         print(f"[Feature Agg] Val   saved: {_out_val.shape[0]} rows → {_orig_val_agg_path}")
