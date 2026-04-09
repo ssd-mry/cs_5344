@@ -48,10 +48,132 @@ class DatasetBundle:
     y_val: pd.Series
 
 
+@dataclass(frozen=True)
+class ThresholdSearchResult:
+    theta_1: float
+    theta_2: float
+    total_cost: int
+    y_pred: np.ndarray
+    used_constraints: bool
+
+
 def total_cost(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> int:
     y_true_array = np.asarray(y_true, dtype=int)
     y_pred_array = np.asarray(y_pred, dtype=int)
     return int(COST_MATRIX[y_true_array, y_pred_array].sum())
+
+
+def threshold_predict(y_pred_proba: np.ndarray, theta_1: float, theta_2: float) -> np.ndarray:
+    """
+    Ordered 3-class thresholding for Safe/Warning/Critical.
+
+    - predict 2 if P(Critical) >= theta_2
+    - else predict 1 if P(Warning) + P(Critical) >= theta_1
+    - else predict 0
+    """
+    p_warning_or_critical = y_pred_proba[:, 1] + y_pred_proba[:, 2]
+    p_critical = y_pred_proba[:, 2]
+
+    y_pred = np.zeros(len(y_pred_proba), dtype=int)
+    y_pred[p_warning_or_critical >= theta_1] = 1
+    y_pred[p_critical >= theta_2] = 2
+    return y_pred
+
+
+def search_optimal_thresholds(
+    y_true: pd.Series,
+    y_pred_proba: np.ndarray,
+    threshold_steps: int = 20,
+    theta_1_min: float = 0.2,
+    theta_1_max: float = 0.8,
+    theta_2_min: float = 0.1,
+    theta_2_max: float = 0.8,
+    safe_recall_min: float = 0.7,
+    enforce_theta_order: bool = True,
+    fallback_to_unconstrained: bool = True,
+) -> ThresholdSearchResult:
+    """
+    Grid-search (theta_1, theta_2) on validation data to minimize total cost.
+    """
+    if threshold_steps < 2:
+        raise ValueError("threshold_steps must be at least 2")
+    if not (0.0 <= theta_1_min <= theta_1_max <= 1.0):
+        raise ValueError("theta_1 range must lie within [0, 1]")
+    if not (0.0 <= theta_2_min <= theta_2_max <= 1.0):
+        raise ValueError("theta_2 range must lie within [0, 1]")
+    if not (0.0 <= safe_recall_min <= 1.0):
+        raise ValueError("safe_recall_min must lie within [0, 1]")
+
+    y_true_array = np.asarray(y_true, dtype=int)
+    theta_1_values = np.linspace(theta_1_min, theta_1_max, threshold_steps)
+    theta_2_values = np.linspace(theta_2_min, theta_2_max, threshold_steps)
+    p_warning_or_critical = y_pred_proba[:, 1] + y_pred_proba[:, 2]
+    p_critical = y_pred_proba[:, 2]
+    safe_mask = y_true_array == 0
+    safe_count = int(safe_mask.sum())
+
+    best_cost: int | None = None
+    best_theta_1 = 0.5
+    best_theta_2 = 0.5
+    best_y_pred: np.ndarray | None = None
+    used_constraints = True
+
+    def _search(theta1_values: np.ndarray, theta2_values: np.ndarray, apply_constraints: bool) -> tuple[int | None, float, float, np.ndarray | None]:
+        local_best_cost: int | None = None
+        local_best_theta_1 = 0.5
+        local_best_theta_2 = 0.5
+        local_best_y_pred: np.ndarray | None = None
+
+        for theta_1 in theta1_values:
+            warn_mask = p_warning_or_critical >= theta_1
+            for theta_2 in theta2_values:
+                if apply_constraints and enforce_theta_order and theta_2 > theta_1:
+                    continue
+                critical_mask = p_critical >= theta_2
+                y_pred = np.zeros(len(y_true_array), dtype=int)
+                y_pred[warn_mask] = 1
+                y_pred[critical_mask] = 2
+
+                if apply_constraints and safe_count > 0:
+                    safe_recall = float((y_pred[safe_mask] == 0).sum()) / safe_count
+                    if safe_recall < safe_recall_min:
+                        continue
+
+                current_cost = int(COST_MATRIX[y_true_array, y_pred].sum())
+                if local_best_cost is None or current_cost < local_best_cost:
+                    local_best_cost = current_cost
+                    local_best_theta_1 = float(theta_1)
+                    local_best_theta_2 = float(theta_2)
+                    local_best_y_pred = y_pred.copy()
+
+        return local_best_cost, local_best_theta_1, local_best_theta_2, local_best_y_pred
+
+    best_cost, best_theta_1, best_theta_2, best_y_pred = _search(
+        theta_1_values,
+        theta_2_values,
+        apply_constraints=True,
+    )
+
+    if best_cost is None and fallback_to_unconstrained:
+        used_constraints = False
+        print("No feasible constrained threshold pair found; falling back to unconstrained threshold search.")
+        unconstrained_values = np.linspace(0.0, 1.0, threshold_steps)
+        best_cost, best_theta_1, best_theta_2, best_y_pred = _search(
+            unconstrained_values,
+            unconstrained_values,
+            apply_constraints=False,
+        )
+
+    if best_cost is None or best_y_pred is None:  # pragma: no cover - defensive
+        raise RuntimeError("Threshold search failed to produce a result")
+
+    return ThresholdSearchResult(
+        theta_1=best_theta_1,
+        theta_2=best_theta_2,
+        total_cost=best_cost,
+        y_pred=best_y_pred,
+        used_constraints=used_constraints,
+    )
 
 
 def last_readout(df: pd.DataFrame) -> pd.DataFrame:
@@ -336,6 +458,14 @@ def run_experiment(
     dataset_bundle: DatasetBundle,
     n_splits: int,
     n_iter: int,
+    enable_threshold_moving: bool,
+    threshold_steps: int,
+    threshold_theta_1_min: float,
+    threshold_theta_1_max: float,
+    threshold_theta_2_min: float,
+    threshold_theta_2_max: float,
+    threshold_safe_recall_min: float,
+    threshold_enforce_theta_order: bool,
 ) -> dict[str, Any]:
     X_train, X_val = align_feature_frames(dataset_bundle.X_train.copy(), dataset_bundle.X_val.copy())
     pipeline = build_model_pipeline(X_train)
@@ -351,7 +481,32 @@ def run_experiment(
     best_estimator = search.best_estimator_
     y_val_pred = best_estimator.predict(X_val)
     y_val_pred_proba = best_estimator.predict_proba(X_val)
-    metrics = evaluate_predictions(dataset_bundle.y_val, y_val_pred, y_val_pred_proba)
+    metrics = {
+        "default_argmax": evaluate_predictions(dataset_bundle.y_val, y_val_pred, y_val_pred_proba),
+    }
+
+    if enable_threshold_moving:
+        threshold_result = search_optimal_thresholds(
+            dataset_bundle.y_val,
+            y_val_pred_proba,
+            threshold_steps=threshold_steps,
+            theta_1_min=threshold_theta_1_min,
+            theta_1_max=threshold_theta_1_max,
+            theta_2_min=threshold_theta_2_min,
+            theta_2_max=threshold_theta_2_max,
+            safe_recall_min=threshold_safe_recall_min,
+            enforce_theta_order=threshold_enforce_theta_order,
+        )
+        metrics["threshold_moving"] = {
+            "best_theta_1": threshold_result.theta_1,
+            "best_theta_2": threshold_result.theta_2,
+            "used_constraints": threshold_result.used_constraints,
+            **evaluate_predictions(
+                dataset_bundle.y_val,
+                threshold_result.y_pred,
+                y_val_pred_proba,
+            ),
+        }
 
     return {
         "experiment": name,
@@ -385,6 +540,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cv-splits", type=int, default=3)
     parser.add_argument("--search-iter", type=int, default=10)
     parser.add_argument("--output-dir", default="artifacts")
+    parser.add_argument(
+        "--enable-threshold-moving",
+        action="store_true",
+        help="Tune cost-sensitive prediction thresholds on the validation set.",
+    )
+    parser.add_argument(
+        "--threshold-steps",
+        type=int,
+        default=20,
+        help="Number of grid points per threshold axis for threshold moving.",
+    )
+    parser.add_argument("--threshold-theta1-min", type=float, default=0.2)
+    parser.add_argument("--threshold-theta1-max", type=float, default=0.8)
+    parser.add_argument("--threshold-theta2-min", type=float, default=0.1)
+    parser.add_argument("--threshold-theta2-max", type=float, default=0.8)
+    parser.add_argument(
+        "--threshold-safe-recall-min",
+        type=float,
+        default=0.7,
+        help="Minimum required recall for class 0 during constrained threshold tuning.",
+    )
+    parser.add_argument(
+        "--disable-threshold-order-constraint",
+        action="store_true",
+        help="Allow threshold search pairs where theta_2 > theta_1.",
+    )
     parser.add_argument(
         "--apply-raw-feature-engineering-preprocess",
         action="store_true",
@@ -436,12 +617,28 @@ def main() -> None:
             dataset_bundle=raw_bundle,
             n_splits=args.cv_splits,
             n_iter=args.search_iter,
+            enable_threshold_moving=args.enable_threshold_moving,
+            threshold_steps=args.threshold_steps,
+            threshold_theta_1_min=args.threshold_theta1_min,
+            threshold_theta_1_max=args.threshold_theta1_max,
+            threshold_theta_2_min=args.threshold_theta2_min,
+            threshold_theta_2_max=args.threshold_theta2_max,
+            threshold_safe_recall_min=args.threshold_safe_recall_min,
+            threshold_enforce_theta_order=not args.disable_threshold_order_constraint,
         ),
         "temporal_aggregation_rfod": run_experiment(
             name="temporal_aggregation_rfod",
             dataset_bundle=agg_bundle,
             n_splits=args.cv_splits,
             n_iter=args.search_iter,
+            enable_threshold_moving=args.enable_threshold_moving,
+            threshold_steps=args.threshold_steps,
+            threshold_theta_1_min=args.threshold_theta1_min,
+            threshold_theta_1_max=args.threshold_theta1_max,
+            threshold_theta_2_min=args.threshold_theta2_min,
+            threshold_theta_2_max=args.threshold_theta2_max,
+            threshold_safe_recall_min=args.threshold_safe_recall_min,
+            threshold_enforce_theta_order=not args.disable_threshold_order_constraint,
         ),
     }
 
