@@ -41,7 +41,8 @@ from badgers.generators.tabular_data.outliers import DecompositionAndOutlierGene
 from sklearn.utils import shuffle
 from numpy.random import default_rng
 
-base_dir = "/Users/ssdmry/Desktop/mry/新加坡/博士/课程/CS5344_Big Data Analytics/cs_5344/Project"
+# base_dir = "/Users/ssdmry/Desktop/mry/新加坡/博士/课程/CS5344_Big Data Analytics/cs_5344/Project"
+base_dir = "/Users/dex/Documents/python-workspace/cs5344_RUL_Predictor/Project"
 parser = argparse.ArgumentParser(description="ndcg + std experiments")
 
 parser.add_argument("--dataset", type=str, required=True, help="Dataset name")
@@ -17779,8 +17780,8 @@ elif dataset_name == "backblaze":
 
 elif dataset_name == "backblaze_clean":
     _bb_clean_dir    = os.path.join(base_dir, "Datasets/Backblaze/clean")
-    _bb_val_ids_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_serial_number_id.csv")
-    _bb_val_lbl_path = os.path.join(base_dir, "Datasets/Backblaze/backblaze_data/val_label.csv")
+    _bb_val_ids_path = os.path.join(base_dir, "Datasets/Backblaze/val_serial_number_id.csv")
+    _bb_val_lbl_path = os.path.join(base_dir, "Datasets/Backblaze/val_label.csv")
 
     _bb_files      = sorted(os.listdir(_bb_clean_dir))
     _bb_train_file = next(f for f in _bb_files if f.startswith("train_set"))
@@ -17799,21 +17800,21 @@ elif dataset_name == "backblaze_clean":
     y_bb_train  = _bb_train["label"].reset_index(drop=True)
 
     # 验证集：取每个磁盘最后一行的滚动特征，join val_label.csv 获取标签
-    _bb_val["date"] = pd.to_datetime(_bb_val["date"], errors="coerce")
-    _bb_val_last = (
-        _bb_val.sort_values(["serial_number", "date"])
-               .drop_duplicates("serial_number", keep="last")
-    )
-    _bb_ids    = pd.read_csv(_bb_val_ids_path)
-    _bb_labels = pd.read_csv(_bb_val_lbl_path)
-    _bb_val_merged = (
-        _bb_val_last
-        .merge(_bb_ids,    on="serial_number", how="inner")
-        .merge(_bb_labels, on="id",            how="inner")
-    )
-    _val_feat_cols = [c for c in _feat_cols if c in _bb_val_merged.columns]
-    X_bb_val = _bb_val_merged[_val_feat_cols].reset_index(drop=True)
-    y_bb_val = _bb_val_merged["label"].astype(int).reset_index(drop=True)
+    # _bb_val["date"] = pd.to_datetime(_bb_val["date"], errors="coerce")
+    # _bb_val_last = (
+    #     _bb_val.sort_values(["serial_number", "date"])
+    #            .drop_duplicates("serial_number", keep="last")
+    # )
+    # _bb_ids    = pd.read_csv(_bb_val_ids_path)
+    # _bb_labels = pd.read_csv(_bb_val_lbl_path)
+    # _bb_val_merged = (
+    #     _bb_val_last
+    #     .merge(_bb_ids,    on="serial_number", how="inner")
+    #     .merge(_bb_labels, on="id",            how="inner")
+    # )
+    _val_feat_cols = [c for c in _feat_cols if c in _bb_val.columns]
+    X_bb_val = _bb_val[_val_feat_cols].reset_index(drop=True)
+    y_bb_val = _bb_val["label"].astype(int).reset_index(drop=True)
 
     X     = pd.concat([X_bb_train[_val_feat_cols], X_bb_val], ignore_index=True)
     y_raw = pd.concat([y_bb_train, y_bb_val], ignore_index=True)
@@ -17834,16 +17835,18 @@ elif dataset_name == "backblaze_clean":
 
     _bb_val_full = pd.read_csv(os.path.join(_bb_clean_dir, _bb_val_file), low_memory=False)
     _bb_val_full["date"] = pd.to_datetime(_bb_val_full["date"], errors="coerce")
-    _bb_val_label_map = (
-        _bb_val_full.sort_values(["serial_number", "date"])
-        .drop_duplicates("serial_number", keep="last")
-        .merge(_bb_ids,    on="serial_number", how="inner")
-        .merge(_bb_labels, on="id",            how="inner")
-        [["serial_number", "label"]].rename(columns={"label": "_lbl"})
-    )
-    _bb_val_full = _bb_val_full.merge(_bb_val_label_map, on="serial_number", how="left")
-    _bb_val_full["label"] = _bb_val_full["_lbl"].fillna(-1).astype(int)
-    _orig_val_df = _bb_val_full.drop(columns=["_lbl"], errors="ignore").copy().reset_index(drop=True)
+    # _bb_val_label_map = (
+    #     _bb_val_full.sort_values(["serial_number", "date"])
+    #     .drop_duplicates("serial_number", keep="last")
+    #     .merge(_bb_ids,    on="serial_number", how="inner")
+    #     .merge(_bb_labels, on="id",            how="inner")
+    #     [["serial_number", "label"]].rename(columns={"label": "_lbl"})
+    # )
+    # _bb_val_full = _bb_val_full.merge(_bb_val_label_map, on="serial_number", how="left")
+    # _bb_val_full["label"] = _bb_val_full["_lbl"].fillna(-1).astype(int)
+    # _orig_val_df = _bb_val_full.drop(columns=["_lbl"], errors="ignore").copy().reset_index(drop=True)
+    _bb_val_full["label"] = _bb_val_full["label"].fillna(-1).astype(int)
+    _orig_val_df = _bb_val_full.copy().reset_index(drop=True)
 
     _orig_train_agg_path = os.path.join(_bb_clean_dir, "backblaze_clean_train_feature_agg.csv")
     _orig_val_agg_path   = os.path.join(_bb_clean_dir, "backblaze_clean_val_feature_agg.csv")
