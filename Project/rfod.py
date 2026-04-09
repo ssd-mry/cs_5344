@@ -18815,11 +18815,11 @@ if dataset_name in ("backblaze_clean", "scania_clean"):
             sys.stdout.flush()
 
         # Train CSV — chunked (may be very large)
-        print(f"[Feature Agg] Scoring train CSV (chunked): {_orig_train_csv_path}")
-        sys.stdout.flush()
-        _n_train = _score_csv_chunked(_orig_train_csv_path, _orig_train_agg_path, _orig_id_cols)
-        print(f"[Feature Agg] Train saved: {_n_train} rows → {_orig_train_agg_path}")
-        sys.stdout.flush()
+        # print(f"[Feature Agg] Scoring train CSV (chunked): {_orig_train_csv_path}")
+        # sys.stdout.flush()
+        # _n_train = _score_csv_chunked(_orig_train_csv_path, _orig_train_agg_path, _orig_id_cols)
+        # print(f"[Feature Agg] Train saved: {_n_train} rows → {_orig_train_agg_path}")
+        # sys.stdout.flush()
 
         # Val CSV — at once (small)
         print("[Feature Agg] Scoring val CSV...")
