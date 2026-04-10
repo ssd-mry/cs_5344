@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.so
+
+.DS_Store
+.idea/
+.ipynb_checkpoints/
+
+.venv/
+venv/
+
+*.log
+
+*.csv

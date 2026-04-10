@@ -191,52 +191,47 @@ def ordinal_risk_score(proba: np.ndarray) -> np.ndarray:
     return (proba * np.arange(proba.shape[1], dtype=np.float64)).sum(axis=1)
 
 
-def predict_with_prob_threshold(proba: np.ndarray, theta: np.ndarray) -> np.ndarray:
-    """Classify using cumulative probability thresholds (teammate approach, extended to 5 classes).
+def predict_with_threshold_vector(proba: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    """Map probabilities to class 0..4 using monotone cut points on s(x).
 
-    theta = (θ₁, θ₂, θ₃, θ₄) where θ_k is the minimum P(class >= k) required to predict class k.
-    pred[i] = max{k in 1..4 : P(class >= k | x_i) >= theta[k-1]}, or 0 if none qualify.
+    theta = (tau_1,...,tau_4) sorted internally: [0,tau_1)->0, [tau_1,tau_2)->1, ...
     """
     proba = np.asarray(proba, dtype=np.float64)
-    theta = np.asarray(theta, dtype=np.float64).ravel()
-    # P(class >= k) for k=1,2,3,4 — shape (N, 4)
-    p_ge = np.stack([proba[:, k:].sum(axis=1) for k in range(1, 5)], axis=1)
-    qualifies = (p_ge >= theta).astype(int) * np.array([1, 2, 3, 4])
-    return qualifies.max(axis=1)
+    s = ordinal_risk_score(proba)
+    t1, t2, t3, t4 = np.sort(np.asarray(theta, dtype=np.float64).ravel())[:4]
+    pred = np.zeros(len(s), dtype=int)
+    pred[s < t1] = 0
+    pred[(s >= t1) & (s < t2)] = 1
+    pred[(s >= t2) & (s < t3)] = 2
+    pred[(s >= t3) & (s < t4)] = 3
+    pred[s >= t4] = 4
+    return pred
 
 
-def tune_prob_threshold(
+def tune_threshold_vector(
     proba: np.ndarray,
     y_true: np.ndarray,
     cost: np.ndarray = COST,
     *,
-    n_grid: int = 10,
+    grid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Find theta* = (θ₁, θ₂, θ₃, θ₄) in [0,1]^4 minimising total cost on validation set.
-
-    Grid search over n_grid^4 combinations (default 10^4 = 10,000).
-    """
+    """Find theta* minimizing sum_i C[y_i, yhat_i] over a grid of monotone (tau_1..tau_4)."""
     proba = np.asarray(proba, dtype=np.float64)
     y_true = np.asarray(y_true, dtype=int)
-    grid = np.linspace(0.05, 0.95, n_grid)
-    # Precompute cumulative probabilities — shape (N, 4)
-    p_ge = np.stack([proba[:, k:].sum(axis=1) for k in range(1, 5)], axis=1)
+    if grid is None:
+        grid = np.linspace(0.0, 4.0, 21)
 
-    best_theta = np.array([0.5, 0.5, 0.5, 0.5])
+    best_theta = np.zeros(4)
     best_tc = np.inf
     best_pred: np.ndarray | None = None
 
-    for t1 in grid:
-        for t2 in grid:
-            for t3 in grid:
-                for t4 in grid:
-                    theta = np.array([t1, t2, t3, t4])
-                    qualifies = (p_ge >= theta).astype(int) * np.array([1, 2, 3, 4])
-                    pred = qualifies.max(axis=1)
-                    tc = total_cost(y_true, pred, cost)
-                    if tc < best_tc:
-                        best_tc = tc
-                        best_theta = theta.copy()
+    for theta_tuple in combinations_with_replacement(grid, 4):
+        theta = np.array(theta_tuple, dtype=np.float64)
+        pred = predict_with_threshold_vector(proba, theta)
+        tc = total_cost(y_true, pred, cost)
+        if tc < best_tc:
+            best_tc = tc
+            best_theta = np.sort(theta)
             best_pred = pred.copy()
 
     assert best_pred is not None
