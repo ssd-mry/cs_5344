@@ -181,6 +181,40 @@ def last_readout(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates("serial_number", keep="last")
 
 
+def sample_nonfailure_training_rows(
+    df: pd.DataFrame,
+    sample_frac: float,
+    sampling_mode: str,
+    few_windows_per_disk: int,
+    random_state: int = RANDOM_STATE,
+) -> pd.DataFrame:
+    if not (0.0 < sample_frac <= 1.0):
+        raise ValueError("sample_frac must lie in (0, 1]")
+    if sampling_mode not in {"last_window", "few_windows"}:
+        raise ValueError("sampling_mode must be one of {'last_window', 'few_windows'}")
+    if few_windows_per_disk < 1:
+        raise ValueError("few_windows_per_disk must be at least 1")
+
+    sorted_df = df.sort_values(["serial_number", "date"], kind="mergesort")
+    nonfailure_serials = sorted_df["serial_number"].drop_duplicates()
+    sample_size = int(np.ceil(len(nonfailure_serials) * sample_frac))
+    sample_size = min(len(nonfailure_serials), max(sample_size, 1))
+
+    sampled_serials = (
+        nonfailure_serials.sample(n=sample_size, random_state=random_state).sort_values().tolist()
+    )
+    sampled_df = sorted_df.loc[sorted_df["serial_number"].isin(sampled_serials)].copy()
+
+    if sampling_mode == "last_window":
+        return last_readout(sampled_df)
+
+    return (
+        sampled_df.groupby("serial_number", sort=False, group_keys=False)
+        .tail(few_windows_per_disk)
+        .copy()
+    )
+
+
 def prepare_raw_training_frame(df: pd.DataFrame, horizon_days: int = 60) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
     Match the reference notebook's raw-data training logic.
@@ -279,30 +313,58 @@ def load_aggregated_train_val(
     train_path: Path,
     val_path: Path,
     train_failed_disks_only: bool = False,
+    nonfailure_sampling_mode: str = "none",
+    nonfailure_sample_frac: float = 0.1,
+    nonfailure_few_windows_per_disk: int = 3,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame, pd.Series]:
     train_df = pd.read_csv(train_path, parse_dates=["date"], low_memory=False)
     val_df = pd.read_csv(val_path, parse_dates=["date"], low_memory=False)
     val_df = last_readout(val_df)
 
-    if train_failed_disks_only:
-        if "failure_date" in train_df.columns:
-            train_df = train_df.loc[train_df["failure_date"].notna()].copy()
-        else:
-            failed_serials = (
-                train_df.groupby("serial_number", sort=False)["failure"]
-                .max()
-                .loc[lambda series: series.eq(1)]
-                .index
+    disk_failure_mask = (
+        train_df.groupby("serial_number", sort=False)["label"]
+        .max()
+        .gt(0)
+    )
+    failed_serials = disk_failure_mask.loc[lambda series: series].index
+    nonfailed_serials = disk_failure_mask.loc[lambda series: ~series].index
+
+    if train_failed_disks_only or nonfailure_sampling_mode != "none":
+        failed_df = train_df.loc[train_df["serial_number"].isin(failed_serials)].copy()
+
+        if nonfailure_sampling_mode != "none":
+            nonfailed_df = train_df.loc[train_df["serial_number"].isin(nonfailed_serials)].copy()
+            sampled_nonfailed_df = sample_nonfailure_training_rows(
+                nonfailed_df,
+                sample_frac=nonfailure_sample_frac,
+                sampling_mode=nonfailure_sampling_mode,
+                few_windows_per_disk=nonfailure_few_windows_per_disk,
             )
-            train_df = train_df.loc[train_df["serial_number"].isin(failed_serials)].copy()
-        print(
-            "Filtered aggregated train set to failed disks only:",
-            {
-                "rows": int(len(train_df)),
-                "unique_disks": int(train_df["serial_number"].nunique()),
-                "label_counts": train_df["label"].value_counts().sort_index().to_dict(),
-            },
-        )
+            train_df = pd.concat([failed_df, sampled_nonfailed_df], ignore_index=True)
+            train_df = train_df.sort_values(["serial_number", "date"], kind="mergesort").reset_index(drop=True)
+            print(
+                "Built aggregated train set from failed disks plus sampled non-failure disks:",
+                {
+                    "sampling_mode": nonfailure_sampling_mode,
+                    "nonfailure_sample_frac": nonfailure_sample_frac,
+                    "few_windows_per_disk": nonfailure_few_windows_per_disk,
+                    "rows": int(len(train_df)),
+                    "unique_disks": int(train_df["serial_number"].nunique()),
+                    "failed_disks": int(len(failed_serials)),
+                    "sampled_nonfailed_disks": int(sampled_nonfailed_df["serial_number"].nunique()),
+                    "label_counts": train_df["label"].value_counts().sort_index().to_dict(),
+                },
+            )
+        else:
+            train_df = failed_df
+            print(
+                "Filtered aggregated train set to failed disks only:",
+                {
+                    "rows": int(len(train_df)),
+                    "unique_disks": int(train_df["serial_number"].nunique()),
+                    "label_counts": train_df["label"].value_counts().sort_index().to_dict(),
+                },
+            )
 
     train_feature_columns_to_drop = [
         "date",
@@ -574,13 +636,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agg-train-failed-disks-only",
         action="store_true",
-        help="Train the aggregated-feature model using only disks that eventually fail in the train set.",
+        help="Train the aggregated-feature model using only disks that eventually fail in the train set. Validation remains unchanged.",
+    )
+    parser.add_argument(
+        "--agg-train-nonfailure-sampling-mode",
+        choices=["none", "last_window", "few_windows"],
+        default="none",
+        help="Augment aggregated training data with sampled non-failure disks while keeping validation unchanged.",
+    )
+    parser.add_argument(
+        "--agg-train-nonfailure-sample-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of non-failure disks to sample when non-failure sampling is enabled.",
+    )
+    parser.add_argument(
+        "--agg-train-nonfailure-few-windows-per-disk",
+        type=int,
+        default=3,
+        help="Number of trailing windows to keep per sampled non-failure disk in few_windows mode.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    print("args:", args)
+
+    if args.agg_train_nonfailure_sampling_mode != "none":
+        if not (0.0 < args.agg_train_nonfailure_sample_frac <= 1.0):
+            raise ValueError("--agg-train-nonfailure-sample-frac must lie in (0, 1]")
+        if args.agg_train_nonfailure_few_windows_per_disk < 1:
+            raise ValueError("--agg-train-nonfailure-few-windows-per-disk must be at least 1")
+        if args.agg_train_failed_disks_only:
+            print(
+                "Non-failure sampling is enabled for aggregated training; the train set will be built from all failed disks plus sampled non-failure disks. Validation stays unchanged."
+            )
+    elif args.agg_train_failed_disks_only:
+        print("Aggregated training will use failed disks only. Validation stays unchanged.")
+    else:
+        print("Aggregated training will use the full train set. Validation stays unchanged.")
 
     raw_X_train, raw_y_train, raw_groups, raw_X_val, raw_y_val = load_raw_train_val(
         train_path=Path(args.train_raw),
@@ -602,6 +697,9 @@ def main() -> None:
         Path(args.train_agg),
         Path(args.val_agg),
         train_failed_disks_only=args.agg_train_failed_disks_only,
+        nonfailure_sampling_mode=args.agg_train_nonfailure_sampling_mode,
+        nonfailure_sample_frac=args.agg_train_nonfailure_sample_frac,
+        nonfailure_few_windows_per_disk=args.agg_train_nonfailure_few_windows_per_disk,
     )
     agg_bundle = DatasetBundle(
         X_train=agg_X_train,
@@ -649,3 +747,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
