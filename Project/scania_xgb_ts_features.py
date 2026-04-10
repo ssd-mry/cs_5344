@@ -39,8 +39,14 @@ def main() -> None:
     cat_cols, num_cols, X_tr = infer_feature_columns(df_tr, drop_cols)
     y_tr = df_tr["label"].astype(int).to_numpy()
 
-    # ── Real validation set (one row per vehicle, label already attached) ──
+    # ── Real validation set (one row per vehicle, label from official labels CSV) ──
     df_va = pd.read_csv(scania / f"validation_features_w{WINDOW_SIZE}.csv")
+    df_va = df_va.drop(columns=["label"], errors="ignore")  # 统一用官方标注，与其他方法保持一致
+    labels_va = pd.read_csv(scania / "validation_labels.csv")
+    df_va = df_va.merge(
+        labels_va.rename(columns={"class_label": "label"})[["vehicle_id", "label"]],
+        on="vehicle_id", how="inner",
+    )
     X_va  = df_va.drop(columns=[c for c in drop_cols if c in df_va.columns], errors="ignore")
     X_va  = X_va.reindex(columns=X_tr.columns, fill_value=np.nan)
     y_va  = df_va["label"].astype(int).to_numpy()

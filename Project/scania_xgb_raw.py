@@ -74,7 +74,7 @@ def main() -> None:
     y_va = df_va["y"].astype(int).to_numpy()
 
     print_fit_val_shapes(
-        len(df_tr), len(X_tr), X_tr.shape[1],
+        int(rep.sum()), len(X_tr), X_tr.shape[1],
         df_tr["vehicle_id"].nunique(), df_va["vehicle_id"].nunique(),
     )
     print_label_counts("Labels (train set, all vehicles)", y_tr)

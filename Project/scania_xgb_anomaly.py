@@ -39,8 +39,8 @@ def main() -> None:
             f"Missing {train_path}. Run rfod (scania_clean) + feature pipeline first."
         )
     df_tr = pd.read_csv(train_path)
-    if "anomaly_score" not in df_tr.columns:
-        raise ValueError("Expected anomaly_score in agg train CSV.")
+    if not any(c.startswith("anomaly_score") for c in df_tr.columns):
+        raise ValueError("Expected anomaly_score_* columns in agg train CSV.")
 
     drop_cols = {"vehicle_id", "time_step", "label", "in_study_repair"}
     cat_cols, num_cols, X_tr = infer_feature_columns(df_tr, drop_cols)
@@ -53,8 +53,14 @@ def main() -> None:
             f"Missing {val_path}. Run rfod (scania_clean) + feature pipeline first."
         )
     df_va = pd.read_csv(val_path)
-    if "anomaly_score" not in df_va.columns:
-        raise ValueError("Expected anomaly_score in agg val CSV.")
+    if not any(c.startswith("anomaly_score") for c in df_va.columns):
+        raise ValueError("Expected anomaly_score_* columns in agg val CSV.")
+    df_va = df_va.drop(columns=["label"], errors="ignore")  # 防止 merge 产生 label_x/label_y
+    labels_va = pd.read_csv(scania / "validation_labels.csv")
+    df_va = df_va.merge(
+        labels_va.rename(columns={"class_label": "label"})[["vehicle_id", "label"]],
+        on="vehicle_id", how="inner",
+    )
     X_va  = df_va.drop(columns=[c for c in drop_cols if c in df_va.columns], errors="ignore")
     X_va  = X_va.reindex(columns=X_tr.columns, fill_value=np.nan)
     y_va  = df_va["label"].astype(int).to_numpy()
