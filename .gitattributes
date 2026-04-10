@@ -1,2 +1,0 @@
-; Project/Datasets/**/*.csv filter=lfs diff=lfs merge=lfs -text
-; Project/results/** filter=lfs diff=lfs merge=lfs -text

@@ -17,16 +17,14 @@ from scania_xgb_common import (
     get_scania_dir,
     infer_feature_columns,
     last_readout,
-    predict_with_threshold_vector,
+    predict_with_prob_threshold,
     print_eval_metrics,
     print_fit_val_shapes,
     print_label_counts,
     print_theta_star_dval,
-    project_dir,
     repair_flag_01,
     rul_to_ordinal,
-    tune_threshold_vector,
-    write_scania_submission_csv,
+    tune_prob_threshold,
 )
 
 
@@ -74,7 +72,7 @@ def main() -> None:
     y_va = df_va["y"].astype(int).to_numpy()
 
     print_fit_val_shapes(
-        len(df_tr), len(X_tr), X_tr.shape[1],
+        int(rep.sum()), len(X_tr), X_tr.shape[1],
         df_tr["vehicle_id"].nunique(), df_va["vehicle_id"].nunique(),
     )
     print_label_counts("Labels (train set, all vehicles)", y_tr)
@@ -85,31 +83,15 @@ def main() -> None:
     pipe.fit(X_tr, y_tr)
 
     proba_va      = pipe.predict_proba(X_va)
-    theta_star, _ = tune_threshold_vector(proba_va, y_va, COST)
+    theta_star, _ = tune_prob_threshold(proba_va, y_va, COST)
     print_theta_star_dval(theta_star)
 
-    pred_va = predict_with_threshold_vector(proba_va, theta_star)
+    pred_va = predict_with_prob_threshold(proba_va, theta_star)
     print_eval_metrics(
         "Validation metrics (real validation set, one row per vehicle)",
         y_va, pred_va, proba_va,
     )
 
-    # ── Refit on train + val combined, then predict test ──
-    X_full = pd.concat([X_tr, X_va], ignore_index=True)
-    y_full = np.concatenate([y_tr, y_va])
-    pipe.fit(X_full, y_full)
-
-    ops_te  = pd.read_csv(scania / "test_operational_readouts.csv")
-    spec_te = pd.read_csv(scania / "test_specifications.csv")
-    df_te   = last_readout(ops_te).merge(spec_te, on="vehicle_id", how="inner")
-    X_te    = df_te.drop(columns=[c for c in drop_cols if c in df_te.columns], errors="ignore")
-    X_te    = X_te.reindex(columns=X_tr.columns, fill_value=np.nan)
-    pred_te = predict_with_threshold_vector(pipe.predict_proba(X_te), theta_star)
-    write_scania_submission_csv(
-        project_dir() / "scania_test_predictions_xgb_raw.csv",
-        df_te["vehicle_id"].to_numpy(),
-        pred_te,
-    )
 
 
 if __name__ == "__main__":
