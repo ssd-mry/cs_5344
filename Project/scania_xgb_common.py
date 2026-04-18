@@ -214,12 +214,19 @@ def tune_threshold_vector(
     cost: np.ndarray = COST,
     *,
     grid: np.ndarray | None = None,
+    min_failure_recall: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Find theta* minimizing sum_i C[y_i, yhat_i] over a grid of monotone (tau_1..tau_4)."""
+    """Find theta* minimizing sum_i C[y_i, yhat_i] over a grid of monotone (tau_1..tau_4).
+
+    min_failure_recall: minimum recall required for failure cases (label > 0 combined).
+    """
     proba = np.asarray(proba, dtype=np.float64)
     y_true = np.asarray(y_true, dtype=int)
     if grid is None:
         grid = np.linspace(0.0, 4.0, 21)
+
+    failure_mask = y_true > 0
+    n_failures = failure_mask.sum()
 
     best_theta = np.zeros(4)
     best_tc = np.inf
@@ -228,13 +235,20 @@ def tune_threshold_vector(
     for theta_tuple in combinations_with_replacement(grid, 4):
         theta = np.array(theta_tuple, dtype=np.float64)
         pred = predict_with_threshold_vector(proba, theta)
+        if min_failure_recall > 0.0 and n_failures > 0:
+            recall = (pred[failure_mask] > 0).sum() / n_failures
+            if recall < min_failure_recall:
+                continue
         tc = total_cost(y_true, pred, cost)
         if tc < best_tc:
             best_tc = tc
             best_theta = np.sort(theta)
             best_pred = pred.copy()
 
-    assert best_pred is not None
+    if best_pred is None:
+        # fallback: no theta meets constraint, use argmax
+        best_pred = np.argmax(proba, axis=1)
+        best_theta = np.zeros(4)
     return best_theta, best_pred
 
 
